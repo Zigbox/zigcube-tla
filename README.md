@@ -37,9 +37,10 @@ One module, `Fencing.tla`.
 | Part | In the model |
 |---|---|
 | Store | Linearizable: every transaction is one action. Leases with a ttl, attached keys deleted at expiry (`Expire`), compare-and-set on revisions. |
-| Agent (one per node) | Registration (`lease_grant`, then the PUT of `/nodes/<node>`, which carries no compare), renewal by the rule of `fencing.renew_after_ms`, the fence timer at `s + ttl − fence_margin`, the fence itself (TERM, KILL after `fence_stop_ms`, gone `fence_kill_latency_ms` later), fencing at once on `LeaseNotFound` and on a refused observed write, registering again when nothing runs, the pass (start what is assigned, report it under the tenure compare, stop strays). |
+| Agent (one per node) | Registration (`lease_grant`, then the PUT of `/nodes/<node>`, which carries no compare, then `publish_store`'s write of the node's store summary, which compares the tenure the PUT returned), renewal by the rule of `fencing.renew_after_ms`, the fence timer at `s + ttl − fence_margin`, the fence itself (TERM, KILL at the nominal fence time plus `fence_stop_ms`, gone `fence_kill_latency_ms` later), fencing at once on `LeaseNotFound` and on a refused compared write, registering again when nothing runs, the pass (start what is assigned and report it under the tenure compare; TERM a stray container, KILL it `stop_grace_ms` later; delete the record of a replica that is gone, under the same compare). |
+| Transport | One request per connection, no retries (`src/agent_http.zig`). A call ends at its deadline (`CallTimeout`): the fence time for an agent that holds a lease, `agent_io_timeout_ms` = the ttl otherwise. A registration PUT that timed out names a lease that has ended, so it cannot land (`TimedOutPutIsDead`). Only a broken connection or a restart of the agent process (`CallLost`, a fault) or a reboot leaves a PUT in flight behind its agent. |
 | Server | Node controller (`mark_ready`, `mark_lost`), replica controller (`remove_lost` after `lost_grace_ms`, the admissibility check), one or two scheduler instances (plan, then a commit with the placement compare set). |
-| Faults | Calls lost, delayed, answered late, or abandoned and applied later (`StalePut`, `StaleKa`); agent crash (a failed call; see below); machine reboot; wedged node; agent clock running slow; a store whose leases suddenly have less time left (`Setback`). |
+| Faults | Calls lost, delayed or answered late; a call whose connection broke, or whose agent restarted, applied later (`StalePut`, `StaleKa`); agent crash (a lost call; see below); machine reboot; wedged node; agent clock running slow; a store clock that steps forward, so that every lease has less time left (`Setback`). |
 | Time | Discrete ticks. The store's clock is real time. An agent's clock may lose at most `SkewActual` ticks per lease period; the inequality is evaluated with `Skew`. |
 
 The fencing inequality is a definition, `InequalityOK`, the same two tests as
@@ -49,10 +50,14 @@ config sets `RequireInequality = FALSE`, so constants that the agent would
 refuse are refused by TLC before it starts.
 
 The constants in the configs are Zigcube's divided down, with the same
-structure: `TTL 6, Margin 3, StopTime 1, KillLatency 1, Skew 1, LostGrace 1`
-against `10000, 3000, 2000, 900, 100, 1000` ms. As in Zigcube, the margin
-equals what the inequality needs exactly: there is no slack but the lost
-grace.
+structure: `TTL 6, Margin 3, StopTime 1, KillLatency 1, Skew 1, LostGrace 1,
+StopGrace 3` against `10000, 3000, 2000, 900, 100, 1000, 5000` ms. As in
+Zigcube, the margin equals what the inequality needs exactly: there is no
+slack but the lost grace. And as in Zigcube, `stop_grace_ms` (the grace of an
+ordinary stop, `src/constants.zig:161`) is longer than `fence_stop_ms` and
+longer than the window I1b names (`LostGrace + KillLatency`, 2 ticks, 1.9 s):
+a stray container takes up to `StopGrace + KillLatency` (4 ticks, 5.9 s) to
+go.
 
 ### Revisions are bits
 
@@ -68,24 +73,45 @@ on revisions, which is what lets TLC check the liveness properties.
 "The agent process is alive and scheduled" (authority.md section 3) is
 modelled as: a tick cannot pass while an agent that is not wedged has a
 deadline due (`Urgent`): the fence at its time, the KILL done, a renewal sent
-once it is due, the pass run. `StepMax` lets a step be that many ticks late. A
-wedged node is exempt from all of it, and nothing on it moves.
+once it is due, the pass run, a stray container gone `StopGrace +
+KillLatency` after its TERM, a call given up at its deadline. `StepMax` lets a
+step be that many ticks late. The fence's KILL is due at the nominal fence
+time plus `fence_stop_ms` whenever the fence began (`begin_fence(ctx, at)`,
+`src/agent.zig`), so a late step adds only what the step that sends the KILL
+is late by. A wedged node is exempt from all of it, and nothing on it moves.
 
 ## What is abstracted away, and why
 
 - **Agent crash and restart** is not a separate action. `lease.json` holds the
   phase, `s`, the lease, the tenure and the kill time; containers run on; and
   `restore` reads the file back. What a crash loses is the call in flight
-  (`CallFail`) and time (which is the agent not acting, bounded by `Urgent`;
-  an outage longer than a deadline is a wedge). A **reboot** is separate: the
-  containers are gone and the kept lease is dropped.
+  (`CallLost`, which may leave the request at the server) and time (which is
+  the agent not acting, bounded by `Urgent`; an outage longer than a deadline
+  is a wedge). A **reboot** is separate: the containers are gone and the kept
+  lease is dropped.
+- **The store summary is written once per lease**, in the step that adopts
+  the lease. Two things the code also does are left out. `store_lease` is in
+  memory, so a restarted agent that restores a held lease writes the summary
+  again, and that write would catch a moved node key; the model's restart
+  makes no write. And the summary is written again when its content changes
+  (an image pulled); in the model the report of a started container stands
+  for every compared write of that pass. Both make the model's agent learn of
+  a superseded tenure later than the real one can, never earlier. Nodes are
+  assumed to have an image store (`ctx.images`); without one `publish_store`
+  writes nothing and the model's `Ack` is too strong.
+- **A stray container may ignore TERM** for the whole of `stop_grace_ms`; one
+  that exits on TERM is the same model with a shorter overlap.
 - **`lease_grant` is immediate and never lost**; the PUT after it is the call
   that can be late or lost. A grant that is lost only leaves an unused lease.
-- **A failed flush of the pass's reports** is not separate from the pass not
-  having run: reports are made within the tick the container starts.
+- **A failed flush of the pass's reports** is not modelled: the report of a
+  started container is made within the tick, and before the agent's next
+  heartbeat (`reconcile` flushes in the step that ran the stages). A flush
+  lost to the network would be retried after the next heartbeat.
 - **Replica ids.** A slot is one unit of work that must run once. Replacing a
-  replica marks the old container `old` and frees the slot; the new replica
-  id is not a value.
+  replica marks the old container `old` (`oldrun` if its start is still to be
+  reported) and frees the slot; the new replica id is not a value. The
+  observed record is one per node and slot (`/observed/.../<node>/<replica>`
+  in Zigcube), so two nodes can each hold a record of the same slot.
 - **Postgres** is the linearizable store. An asynchronous standby is
   unsupported (`docs/operations.md`) and not modelled. What a failover or a
   clock step can do to leases is modelled as `Setback`.
@@ -115,16 +141,18 @@ wedged node is exempt from all of it, and nothing on it moves.
 | Property in `Fencing.tla` | authority.md | Says |
 |---|---|---|
 | `I1a_OneAssignment` | I1a | A slot's replica has at most one assignment. |
-| `I1a_OneAdmissibleTenure` | I1a, section 3 | An admissible observation is of the assigned node, under its registered tenure. |
+| `I1a_OneAdmissibleTenure` | I1a, section 3 | Of the nodes' records of a slot, at most one is admissible, and it is the assigned node's, under its registered tenure. |
 | `DeadBeforeExpiry` | section 3, the inequality | When an agent's lease ends at the store, its containers are gone (or go within the tick). |
 | `I1b_NoOverlap` | I1b; section 3, "the agent has finished stopping before any replacement is placed" | A slot's work never runs on two nodes at once. |
 | `I1b_Window` | I1b as section 4 words it | Not for longer than `lost_grace_ms` plus kill latency. |
-| `I2_NoStaleCommit` | I2 | No observed write or placement commits on a superseded tenure or plan. |
-| `I3_NoInadmissibleCause` | I3 | No decision cites an inadmissible observation. |
+| `I2_NoStaleCommit` | I2 | No observed write, store summary or placement commits on a superseded tenure or plan. |
+| `I3_NoInadmissibleCause` | I3 | No decision cites an inadmissible record, whichever node wrote it. |
 | `I7_PlacedOnReady` | I7 | No placement onto a node that is not ready at the commit. |
 | `TenureEndFencesAtOnce` | decision 2026-11-08 | An agent told that its tenure ended has stopped everything within the fence's own time. |
 | `FencingSettles` (liveness) | section 3; decision 2026-11-06 | Once faults stop, every agent holds a lease, a current tenure and a ready node, for good. |
 | `WorkComesBack` (liveness) | `docs/core.md` | Once faults stop, every slot is assigned and running on its node, for good. |
+| `TimedOutPutIsDead` | `src/agent_http.zig`, `agent_io_timeout_ms` = ttl | When a registration PUT reaches its timeout, the lease it names has ended at the store: a timed-out PUT cannot land. |
+| `StrayOverlapShorterThanStopGrace` | | A probe, not a property: false in `finding-stale-put-stop-grace`, where it gives the trace of finding 1 at its full length. |
 | `TypeOK`, `LeaseSlotsSuffice` | | Checks of the model itself. |
 
 The liveness properties are checked under `Fairness`: weak fairness of time,

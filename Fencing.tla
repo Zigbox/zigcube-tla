@@ -243,10 +243,14 @@ Register(a) ==
                    obs, plan, histVars>>
 
 \* The fence is looked at before the heartbeat (reconcile), so no renewal is
-\* sent at or after the fence time.
+\* sent at or after the fence time.  The heartbeat comes before the pass and
+\* the pass flushes its reports in the step that started the container, so
+\* no renewal comes between a start and its report.
+Unreported(a) == \E s \in Slots : cont[a][s] \in {"run", "oldrun"}
 Renew(a) ==
     /\ CanAct(a) /\ phase[a] = "held" /\ callKind[a] = "none"
     /\ age[a] >= RenewAfter /\ age[a] < FenceAt
+    /\ ~Unreported(a)
     /\ callKind' = [callKind EXCEPT ![a] = "ka"]
     /\ callSt' = [callSt EXCEPT ![a] = "req"]
     /\ callL' = [callL EXCEPT ![a] = myLease[a]]
