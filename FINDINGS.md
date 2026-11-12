@@ -212,7 +212,8 @@ a2's (the fence's 2, and one tick its clock may lose); the window is 2.
 16 ServeStale      PUT(L2) applied: /nodes/a1 -> L2, which has 1 left
 20 Expire          /nodes/a1 deleted with L2
 21 MarkLost a1
-22-28              Renew(L3), Serve ok, Ack, Tick, Tick; back to 22, for ever
+19-23              a1 renews L3: served, acknowledged
+24-28              Tick, Tick, Renew(L3), Serve ok, Ack; back to 24, for ever
 ```
 
 The node is lost, its agent is `held` and renewing, and nothing in the

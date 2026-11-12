@@ -16,7 +16,7 @@ sim-c1 simulator and shares nothing with it.
 ## How to run
 
 ```sh
-./run.sh                  # every config but the slow one; about 14 minutes on 4 cores
+./run.sh                  # every config but the slow one; about 16 minutes on 4 cores
 ./run.sh --slow           # the slow one too
 ./run.sh base teeth-skew  # only these
 ```
@@ -167,37 +167,38 @@ cannot tell "equal" from "one millisecond late".
 
 TLC 2.19 (tla2tools v1.7.4), 4 workers, OpenJDK 21.
 
-| config                       | expected                         | result                           |  generated |  distinct | depth |  time |  |
-|------------------------------|----------------------------------|----------------------------------|------------|-----------|-------|-------|------|
-| base                         | ok                               | ok                               |     920591 |    206272 |    48 |    6s | pass |
-| both-faulty (`--slow`)       | ok                               | not finished: stopped at 13 min  |          - |   > 18 M  |     - |     - | not run by default |
-| finding-spent-grace          | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |    1473145 |    308028 |    34 |    7s | pass |
-| finding-stale-put            | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |   15906819 |   3205024 |    29 |   52s | pass |
-| finding-stale-put-live       | temporal                         | temporal                         |    2159148 |    577314 |     - |   65s | pass |
-| finding-stale-put-window     | invariant I1b_Window             | invariant I1b_Window             |   27651564 |   5379794 |    37 |   85s | pass |
-| finding-step-lag             | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |    1669145 |    428090 |    26 |    8s | pass |
-| finding-store-setback        | invariant I1b_Window             | invariant I1b_Window             |    6699076 |   1472800 |    29 |   24s | pass |
-| live                         | ok                               | ok                               |    1733698 |    412544 |    49 |   66s | pass |
-| live-short-window            | ok                               | ok                               |    1585832 |    366844 |    49 |   60s | pass |
-| setback-fences-at-once       | ok                               | ok                               |   17562128 |   3472005 |    63 |   61s | pass |
-| slow-node-controller         | ok                               | ok                               |    2113760 |    416871 |    53 |   10s | pass |
-| stale-keepalive              | ok                               | ok                               |   22376042 |   3870620 |    68 |   70s | pass |
-| step-lag-within-grace        | ok                               | ok                               |   21011990 |   4306317 |    68 |   77s | pass |
-| teeth-inadmissible           | invariant I3_NoInadmissibleCause | invariant I3_NoInadmissibleCause |       9384 |      3397 |    13 |    2s | pass |
-| teeth-margin                 | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |     638629 |    145868 |    28 |    4s | pass |
-| teeth-no-absent-compare      | invariant I1a_OneAssignment      | invariant I1a_OneAssignment      |       4512 |      1652 |    11 |    2s | pass |
-| teeth-no-fence-on-conflict   | invariant TenureEndFencesAtOnce  | invariant TenureEndFencesAtOnce  |     774599 |    204390 |    20 |    4s | pass |
-| teeth-no-fence-on-lease-gone | invariant TenureEndFencesAtOnce  | invariant TenureEndFencesAtOnce  |     483080 |    129840 |    19 |    4s | pass |
-| teeth-no-lost-grace          | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |     486239 |    117138 |    27 |    4s | pass |
-| teeth-no-ready-compare       | invariant I7_PlacedOnReady       | invariant I7_PlacedOnReady       |       1304 |       538 |     9 |    1s | pass |
-| teeth-no-tenure-compare      | invariant I2_NoStaleCommit       | invariant I2_NoStaleCommit       |      41012 |     13898 |    14 |    2s | pass |
-| teeth-old-renew              | temporal                         | temporal                         |    1824925 |    508682 |     - |   65s | pass |
-| teeth-skew                   | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |     672131 |    156935 |    28 |    4s | pass |
-| teeth-skew-window            | invariant I1b_Window             | invariant I1b_Window             |    1998409 |    434321 |    35 |    9s | pass |
-| teeth-wedge                  | invariant I1b_Window             | invariant I1b_Window             |    1520671 |    415423 |    33 |    8s | pass |
-| three-agents                 | ok                               | ok                               |   14000599 |   2653240 |    54 |   58s | pass |
-| two-schedulers               | ok                               | ok                               |    3899633 |    731949 |    65 |   16s | pass |
-| two-slots                    | ok                               | ok                               |    6727006 |   1393270 |    59 |   31s | pass |
+| config                       | expected                                   | result                                     |  generated |  distinct | depth |  time |  |
+|------------------------------|--------------------------------------------|--------------------------------------------|------------|-----------|-------|-------|------|
+| base                         | ok                                         | ok                                         |     919477 |    205460 |    48 |    5s | pass |
+| both-faulty (`--slow`)       | ok                                         | not finished (see below)                   |          - |         - |     - |     - | not run by default |
+| finding-spent-grace          | invariant I1b_NoOverlap                    | invariant I1b_NoOverlap                    |    1517764 |    317625 |    35 |    7s | pass |
+| finding-stale-put            | invariant I1b_NoOverlap                    | invariant I1b_NoOverlap                    |   17813409 |   3602889 |    30 |   55s | pass |
+| finding-stale-put-live       | temporal                                   | temporal                                   |    2376595 |    644760 |     - |   66s | pass |
+| finding-stale-put-stop-grace | invariant StrayOverlapShorterThanStopGrace | invariant StrayOverlapShorterThanStopGrace |   37549972 |   7188046 |    43 |  114s | pass |
+| finding-stale-put-window     | invariant I1b_Window                       | invariant I1b_Window                       |   32780313 |   6422954 |    40 |  100s | pass |
+| finding-step-lag             | invariant I1b_NoOverlap                    | invariant I1b_NoOverlap                    |    1564499 |    402738 |    26 |    8s | pass |
+| finding-store-setback        | invariant I1b_Window                       | invariant I1b_Window                       |    9478043 |   2037122 |    32 |   30s | pass |
+| live                         | ok                                         | ok                                         |    1741678 |    410920 |    49 |   61s | pass |
+| live-short-window            | ok                                         | ok                                         |    1597470 |    367228 |    49 |   52s | pass |
+| setback-fences-at-once       | ok                                         | ok                                         |   21855739 |   4301414 |    71 |   75s | pass |
+| slow-node-controller         | ok                                         | ok                                         |    2083138 |    411456 |    52 |    9s | pass |
+| stale-keepalive              | ok                                         | ok                                         |   21490010 |   3736060 |    69 |   69s | pass |
+| step-lag-within-grace        | ok                                         | ok                                         |   16606061 |   3421392 |    66 |   60s | pass |
+| teeth-inadmissible           | invariant I3_NoInadmissibleCause           | invariant I3_NoInadmissibleCause           |       9901 |      3602 |    13 |    1s | pass |
+| teeth-margin                 | invariant I1b_NoOverlap                    | invariant I1b_NoOverlap                    |     618390 |    140821 |    29 |    4s | pass |
+| teeth-no-absent-compare      | invariant I1a_OneAssignment                | invariant I1a_OneAssignment                |       3845 |      1402 |    11 |    1s | pass |
+| teeth-no-fence-on-conflict   | invariant TenureEndFencesAtOnce            | invariant TenureEndFencesAtOnce            |     778535 |    204791 |    20 |    5s | pass |
+| teeth-no-fence-on-lease-gone | invariant TenureEndFencesAtOnce            | invariant TenureEndFencesAtOnce            |     663696 |    171910 |    20 |    4s | pass |
+| teeth-no-lost-grace          | invariant I1b_NoOverlap                    | invariant I1b_NoOverlap                    |     484199 |    115772 |    28 |    4s | pass |
+| teeth-no-ready-compare       | invariant I7_PlacedOnReady                 | invariant I7_PlacedOnReady                 |        852 |       388 |    10 |    1s | pass |
+| teeth-no-tenure-compare      | invariant I2_NoStaleCommit                 | invariant I2_NoStaleCommit                 |       6330 |      2459 |    10 |    1s | pass |
+| teeth-old-renew              | temporal                                   | temporal                                   |    2011738 |    555195 |     - |   65s | pass |
+| teeth-skew                   | invariant I1b_NoOverlap                    | invariant I1b_NoOverlap                    |     722016 |    165661 |    29 |    4s | pass |
+| teeth-skew-window            | invariant I1b_Window                       | invariant I1b_Window                       |    2044941 |    447186 |    36 |    9s | pass |
+| teeth-wedge                  | invariant I1b_Window                       | invariant I1b_Window                       |    1432837 |    389624 |    33 |    7s | pass |
+| three-agents                 | ok                                         | ok                                         |   14147571 |   2675000 |    54 |   55s | pass |
+| two-schedulers               | ok                                         | ok                                         |    3912841 |    731390 |    63 |   17s | pass |
+| two-slots                    | ok                                         | ok                                         |    6464011 |   1337502 |    64 |   29s | pass |
 
 Generated and distinct states are TLC's counts when it stopped: at the end for a
 passing config, at the violation for the others. `both-faulty` (faults on both
@@ -208,7 +209,9 @@ A config named `teeth-*` takes one safeguard away, or breaks one assumption
 that authority.md states, and must fail: "a model that cannot fail proves
 nothing". A config named `finding-*` runs the protocol as the code has it,
 under a fault that authority.md does not exclude, and fails; each is a finding
-in FINDINGS.md.
+in FINDINGS.md. `finding-stale-put-stop-grace` checks a probe and not a
+property: its trace is finding 1 with the stray container there for the whole
+of `stop_grace_ms` plus the kill latency.
 
 | Teeth config | What is taken away | TLC reports |
 |---|---|---|
@@ -218,9 +221,9 @@ in FINDINGS.md.
 | `teeth-margin` | ZC-E0121: `fence_margin` one tick under what the inequality needs | `I1b_NoOverlap` violated |
 | `teeth-no-lost-grace` | `lost_grace_ms` | `I1b_NoOverlap` violated |
 | `teeth-old-renew` | the 2026-11-06 renewal rule: back to `ttl / 3` with a fence window of `ttl / 3` | `FencingSettles` violated: the agent fences on every lease |
-| `teeth-no-fence-on-conflict` | 2026-11-08: a refused observed write no longer fences at once | `TenureEndFencesAtOnce` violated |
+| `teeth-no-fence-on-conflict` | 2026-11-08: a refused compared write no longer fences at once | `TenureEndFencesAtOnce` violated |
 | `teeth-no-fence-on-lease-gone` | `LeaseNotFound` on a keepalive no longer fences at once | `TenureEndFencesAtOnce` violated |
-| `teeth-no-tenure-compare` | the tenure compare of observed writes | `I2_NoStaleCommit` violated |
+| `teeth-no-tenure-compare` | the tenure compare of the agent's writes | `I2_NoStaleCommit` violated |
 | `teeth-no-ready-compare` | the node and status compares of a placement | `I7_PlacedOnReady` violated |
 | `teeth-no-absent-compare` | the "assignment absent" compare, with two schedulers | `I1a_OneAssignment` violated |
 | `teeth-inadmissible` | the admissibility check | `I3_NoInadmissibleCause` violated |

@@ -46,10 +46,10 @@ fi
 unset JAVA_TOOL_OPTIONS
 mkdir -p out
 failed=0
-printf '| %-28s | %-32s | %-32s | %10s | %9s | %5s | %5s | %s |\n' \
+printf '| %-28s | %-42s | %-42s | %10s | %9s | %5s | %5s | %s |\n' \
     config expected result generated distinct depth time ""
-printf '|%s|%s|%s|%s|%s|%s|%s|%s|\n' ------------------------------ ---------------------------------- \
-    ---------------------------------- ------------ ----------- ------- ------- ------
+printf '|%s|%s|%s|%s|%s|%s|%s|%s|\n' ------------------------------ -------------------------------------------- \
+    -------------------------------------------- ------------ ----------- ------- ------- ------
 for name in "${names[@]}"; do
     cfg="configs/${name}.cfg"
     [ -f "$cfg" ] || { echo "run.sh: no such config: $cfg" >&2; exit 2; }
@@ -76,7 +76,7 @@ for name in "${names[@]}"; do
     depth=$(sed -n 's/^The depth of the complete state graph search is \([0-9]*\).*/\1/p' "$log" | tail -1)
     verdict=pass
     if [ "$result" != "$expected" ]; then verdict=FAIL; failed=1; fi
-    printf '| %-28s | %-32s | %-32s | %10s | %9s | %5s | %4ss | %s |\n' \
+    printf '| %-28s | %-42s | %-42s | %10s | %9s | %5s | %4ss | %s |\n' \
         "$name" "$expected" "$result" "${generated:--}" "${distinct:--}" "${depth:--}" "$elapsed" "$verdict"
 done
 if [ "$failed" -ne 0 ]; then
