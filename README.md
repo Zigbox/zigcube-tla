@@ -17,7 +17,7 @@ sim-c1 simulator and shares nothing with it.
 
 ```sh
 ./run.sh                  # every config but the slow one; about 16 minutes on 4 cores
-./run.sh --slow           # the slow one too
+./run.sh --slow           # the slow one too; about 15 minutes more
 ./run.sh base teeth-skew  # only these
 ```
 
@@ -125,8 +125,8 @@ is late by. A wedged node is exempt from all of it, and nothing on it moves.
 
 - **Faults touch one agent** (`Faulty = {a1}`) in every config but
   `both-faulty`; the other agents register, renew and run work with prompt
-  replies. With both agents faulty the state space is above 18 million
-  distinct states (see the results table).
+  replies. With both agents faulty the state space is about 40 million
+  distinct states and takes 15 minutes (see the results table).
 - **The node controller is prompt** (`NodeCtlPrompt`): it judges a node within
   the tick. Without that TLC finds finding 2; `slow-node-controller` and
   `finding-spent-grace` run with it off.
@@ -170,7 +170,7 @@ TLC 2.19 (tla2tools v1.7.4), 4 workers, OpenJDK 21.
 | config                       | expected                                   | result                                     |  generated |  distinct | depth |  time |  |
 |------------------------------|--------------------------------------------|--------------------------------------------|------------|-----------|-------|-------|------|
 | base                         | ok                                         | ok                                         |     919477 |    205460 |    48 |    5s | pass |
-| both-faulty (`--slow`)       | ok                                         | not finished (see below)                   |          - |         - |     - |     - | not run by default |
+| both-faulty (`--slow`)       | ok                                         | ok                                         |  263672693 |  39528972 |    72 |  890s | pass |
 | finding-spent-grace          | invariant I1b_NoOverlap                    | invariant I1b_NoOverlap                    |    1517764 |    317625 |    35 |    7s | pass |
 | finding-stale-put            | invariant I1b_NoOverlap                    | invariant I1b_NoOverlap                    |   17813409 |   3602889 |    30 |   55s | pass |
 | finding-stale-put-live       | temporal                                   | temporal                                   |    2376595 |    644760 |     - |   66s | pass |
@@ -202,8 +202,8 @@ TLC 2.19 (tla2tools v1.7.4), 4 workers, OpenJDK 21.
 
 Generated and distinct states are TLC's counts when it stopped: at the end for a
 passing config, at the violation for the others. `both-faulty` (faults on both
-agents) was stopped by hand with its queue still growing; nothing was violated
-in the 18 million states it had seen. It is not evidence either way.
+agents) is not run by default because it takes about 15 minutes on its own; it
+ran to the end with nothing violated.
 
 A config named `teeth-*` takes one safeguard away, or breaks one assumption
 that authority.md states, and must fail: "a model that cannot fail proves
