@@ -56,8 +56,10 @@ write between the stale PUT and the replacement, which is the usual state of a
 node whose containers are all running and reported. A connected agent then
 sees the replica gone and stops the stray container on its next pass
 (`src/agent.zig:1339-1346`); one that is partitioned from the watch but not
-from keepalives, or slow, runs on. `finding-stale-put-window` shows the
-overlap outlasting `lost_grace_ms` plus kill latency.
+from keepalives, or slow, runs on (this last case is read from the code; the
+model's agent always runs its pass on time, so TLC's traces show the bounded
+forms). `finding-stale-put-window` shows the overlap outlasting
+`lost_grace_ms` plus kill latency even so.
 
 The same fault also breaks liveness without any overlap
 (`finding-stale-put-live`): with nothing running, the agent renews L2 for
@@ -65,7 +67,51 @@ ever, never writes, never learns; the node stays lost and gets no work.
 
 **Trace** (`finding-stale-put`, 28 states, `I1b_NoOverlap`):
 
-TRACE_STALE_PUT
+```
+ 2 Register a1     lease L1 granted (ttl 6); PUT /nodes/a1 on L1 sent
+ 3 CallFail a1     the agent gives the PUT up; the request is still on its way
+ 4-7 Tick x4       L1 has 2 left
+ 8 Register a1     lease L2 granted; PUT /nodes/a1 on L2 sent
+ 9 Serve           PUT(L2) applied: /nodes/a1 -> L2          (reply delayed)
+10 ServeStale      PUT(L1) applied: /nodes/a1 -> L1          <-- the bug
+11 MarkReady a1
+12-13 Plan, Commit s1 assigned to a1
+14 Tick            L1 has 1 left, L2 has 5
+15-18              a2 registers, is marked ready
+19 Tick            L1 has 0 left
+20 Expire a1       /nodes/a1 deleted (it was on L1); L2 lives on, 4 left
+21 MarkLost a1
+22 Tick            lost for 1 = LostGrace
+23 Ack a1          reply to PUT(L2) arrives: a1 is `held` on L2, age 2 < fence time 3
+24 Start a1        a1 starts s1
+25 Replace         replica controller: a1 is lost, grace over; s1 freed
+26-27 Plan, Commit s1 assigned to a2
+28 Start a2        s1 runs on a1 and on a2.  a1: phase held, lease L2 with 3 left,
+                   2 ticks before its fence time.  I1b_NoOverlap violated.
+```
+
+Here a1 has not yet reported, so its next pass ends it (the stray stop, or the
+refused report and the fence at once). `finding-stale-put-window` (37 states)
+continues that way: the report at state 25 is refused, a1 fences at once, and
+its container is still there 3 ticks after a2's started; the window I1b names
+is `LostGrace + KillLatency` = 2. The fence at once takes `StopTime +
+KillLatency` (2900 ms in Zigcube) and the replacement did not wait for it,
+because the store never promised to: the lease it expired was not the agent's.
+
+`finding-stale-put-live` (one agent, nothing to run), after the faults stop:
+
+```
+ 2 Register a1     L1; PUT sent      3 CallFail (PUT still on its way)
+ 4 Heal            no fault from here on
+ 9 Register a1     L2; PUT sent     10 Serve: /nodes/a1 -> L2
+11 ServeStale      /nodes/a1 -> L1  13 Ack: a1 held on L2
+16 Expire          /nodes/a1 deleted with L1
+17 MarkLost a1
+18-23              Tick, Renew(L2), Serve ok, Ack, Tick, Tick; back to 18, for ever
+```
+
+The node is lost, its agent is `held` and renewing, and nothing in the
+protocol tells it.
 
 **Suggested repair** (not applied, not modelled as a fix beyond the first):
 
@@ -113,7 +159,27 @@ the sentence in authority.md.
 
 **Trace** (`finding-spent-grace`, 34 states, `I1b_NoOverlap`):
 
-TRACE_SPENT_GRACE
+```
+ 2-6               a1 registers on L1 (reply not yet back), marked ready; s1 assigned to a1
+ 7 CallFail a1     the reply to the PUT is lost; a1 is idle
+ 8-10 Tick x3
+11 Register a1     L2 granted; PUT sent, delayed
+12-14 Tick x3      L1 has 0 left
+15 Expire a1       /nodes/a1 deleted
+16 MarkLost a1     status lost, at_ms = now (t0)
+17 Serve           PUT(L2) applied: /nodes/a1 -> L2.  The node controller does not
+                   get to it: status stays `lost` with at_ms = t0
+18 Ack a1          a1 held on L2, age 2
+19 Start a1        a1 starts s1 (its assignment was never removed)
+20 Renew a1        keepalive sent, then lost (23)
+21 Tick            t0 + LostGrace has passed
+24 TimerFence a1   age 3 = fence time: TERM; KILL due at 4, gone by 5
+28-29 Tick x2      L2 has 0 left; a1 age 5: the container goes in this tick
+30 Expire a1       /nodes/a1 deleted
+31 Replace         status is `lost` since t0, grace long over: s1 freed at once
+32-33 Plan, Commit s1 assigned to a2
+34 Start a2        same tick as a1's kill completes.  I1b_NoOverlap violated.
+```
 
 **Suggested repair:** count the grace from the expiry that the replica
 controller sees (a `lost` record written at each expiry, or `remove_lost`
@@ -147,7 +213,23 @@ says it is unsupported (ZC-E0215), so it is not a finding.
 
 **Trace** (`finding-store-setback`, `I1b_Window`):
 
-TRACE_SETBACK
+```
+ 2-6               a1 registers on L1 (reply delayed), marked ready; s1 assigned to a1
+ 7 StoreSetback    the store's clock steps forward: L1 has 1 left, not 6
+ 8 Tick            L1 has 0 left
+ 9-10              a2 registers
+11 Expire a1       /nodes/a1 deleted
+13 MarkLost a1
+15 Tick            lost for 1 = LostGrace
+16 Ack a1          the reply to a1's PUT arrives: held, age 2, a full tick before
+                   its fence time
+17 Start a1        a1 starts s1
+18 Report a1       refused (tenure superseded): a1 fences at once, KILL due at 3
+19 Replace         s1 freed
+20-23              s1 assigned to a2, started, reported
+24-29 Tick x3      a1's container is there for 3 ticks next to a2's.
+                   Window is LostGrace + KillLatency = 2.  I1b_Window violated.
+```
 
 **Suggested repair:** say in authority.md that the store's clock must not step
 forward by more than a stated bound (and add that bound to the inequality), or
@@ -175,7 +257,21 @@ of two ticks everything holds (`step-lag-within-grace`).
 
 **Trace** (`finding-step-lag`, `I1b_NoOverlap`):
 
-TRACE_STEP_LAG
+```
+ 2-5               a1 registers on L1, held, marked ready
+ 6-9 Tick x4       a1's clock lost one tick (the skew bound): age 3, L1 has 2 left
+10-15              a2 registers; s1 assigned to a1
+16 Start a1        a1 starts s1
+17 TimerFence a1   age 3: TERM.  KILL nominally at 4, gone by 5; with a step one
+                   tick late, by 6
+18-19 Tick x2      L1 has 0 left; a1 age 5
+20 Expire a1
+21 MarkLost a1
+22 Tick            lost for 1 = LostGrace; a1 age 6: the container goes in this tick
+23 Replace         s1 freed
+24-25 Plan, Commit s1 assigned to a2
+26 Start a2        a1's container is still there.  I1b_NoOverlap violated.
+```
 
 **Suggested repair:** add the step bound to `margin_needed_ms` (and to
 ZC-E0121), and have the fence fire from a timer that does not wait for the

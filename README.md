@@ -16,7 +16,7 @@ sim-c1 simulator and shares nothing with it.
 ## How to run
 
 ```sh
-./run.sh                  # every config but the slow one; about 10 minutes on 4 cores
+./run.sh                  # every config but the slow one; about 14 minutes on 4 cores
 ./run.sh --slow           # the slow one too
 ./run.sh base teeth-skew  # only these
 ```
@@ -139,7 +139,42 @@ cannot tell "equal" from "one millisecond late".
 
 TLC 2.19 (tla2tools v1.7.4), 4 workers, OpenJDK 21.
 
-RESULTS_TABLE
+| config                       | expected                         | result                           |  generated |  distinct | depth |  time |  |
+|------------------------------|----------------------------------|----------------------------------|------------|-----------|-------|-------|------|
+| base                         | ok                               | ok                               |     920591 |    206272 |    48 |    6s | pass |
+| both-faulty (`--slow`)       | ok                               | not finished: stopped at 13 min  |          - |   > 18 M  |     - |     - | not run by default |
+| finding-spent-grace          | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |    1473145 |    308028 |    34 |    7s | pass |
+| finding-stale-put            | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |   15906819 |   3205024 |    29 |   52s | pass |
+| finding-stale-put-live       | temporal                         | temporal                         |    2159148 |    577314 |     - |   65s | pass |
+| finding-stale-put-window     | invariant I1b_Window             | invariant I1b_Window             |   27651564 |   5379794 |    37 |   85s | pass |
+| finding-step-lag             | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |    1669145 |    428090 |    26 |    8s | pass |
+| finding-store-setback        | invariant I1b_Window             | invariant I1b_Window             |    6699076 |   1472800 |    29 |   24s | pass |
+| live                         | ok                               | ok                               |    1733698 |    412544 |    49 |   66s | pass |
+| live-short-window            | ok                               | ok                               |    1585832 |    366844 |    49 |   60s | pass |
+| setback-fences-at-once       | ok                               | ok                               |   17562128 |   3472005 |    63 |   61s | pass |
+| slow-node-controller         | ok                               | ok                               |    2113760 |    416871 |    53 |   10s | pass |
+| stale-keepalive              | ok                               | ok                               |   22376042 |   3870620 |    68 |   70s | pass |
+| step-lag-within-grace        | ok                               | ok                               |   21011990 |   4306317 |    68 |   77s | pass |
+| teeth-inadmissible           | invariant I3_NoInadmissibleCause | invariant I3_NoInadmissibleCause |       9384 |      3397 |    13 |    2s | pass |
+| teeth-margin                 | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |     638629 |    145868 |    28 |    4s | pass |
+| teeth-no-absent-compare      | invariant I1a_OneAssignment      | invariant I1a_OneAssignment      |       4512 |      1652 |    11 |    2s | pass |
+| teeth-no-fence-on-conflict   | invariant TenureEndFencesAtOnce  | invariant TenureEndFencesAtOnce  |     774599 |    204390 |    20 |    4s | pass |
+| teeth-no-fence-on-lease-gone | invariant TenureEndFencesAtOnce  | invariant TenureEndFencesAtOnce  |     483080 |    129840 |    19 |    4s | pass |
+| teeth-no-lost-grace          | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |     486239 |    117138 |    27 |    4s | pass |
+| teeth-no-ready-compare       | invariant I7_PlacedOnReady       | invariant I7_PlacedOnReady       |       1304 |       538 |     9 |    1s | pass |
+| teeth-no-tenure-compare      | invariant I2_NoStaleCommit       | invariant I2_NoStaleCommit       |      41012 |     13898 |    14 |    2s | pass |
+| teeth-old-renew              | temporal                         | temporal                         |    1824925 |    508682 |     - |   65s | pass |
+| teeth-skew                   | invariant I1b_NoOverlap          | invariant I1b_NoOverlap          |     672131 |    156935 |    28 |    4s | pass |
+| teeth-skew-window            | invariant I1b_Window             | invariant I1b_Window             |    1998409 |    434321 |    35 |    9s | pass |
+| teeth-wedge                  | invariant I1b_Window             | invariant I1b_Window             |    1520671 |    415423 |    33 |    8s | pass |
+| three-agents                 | ok                               | ok                               |   14000599 |   2653240 |    54 |   58s | pass |
+| two-schedulers               | ok                               | ok                               |    3899633 |    731949 |    65 |   16s | pass |
+| two-slots                    | ok                               | ok                               |    6727006 |   1393270 |    59 |   31s | pass |
+
+Generated and distinct states are TLC's counts when it stopped: at the end for a
+passing config, at the violation for the others. `both-faulty` (faults on both
+agents) was stopped by hand with its queue still growing; nothing was violated
+in the 18 million states it had seen. It is not evidence either way.
 
 A config named `teeth-*` takes one safeguard away, or breaks one assumption
 that authority.md states, and must fail: "a model that cannot fail proves
