@@ -30,6 +30,8 @@ CONSTANTS
     TTL,             \* lease_ttl_ms
     Margin,          \* fence_margin_ms
     StopTime,        \* fence_stop_ms: TERM to KILL
+    StopGrace,       \* stop_grace_ms: TERM to KILL when the pass stops one
+                     \* container whose replica is gone (not a fence)
     KillLatency,     \* fence_kill_latency_ms: KILL to the process gone
     LostGrace,       \* lost_grace_ms: mark_lost to replacement
     Skew,            \* ttl * clock_skew: the ticks the inequality allows an
@@ -43,9 +45,10 @@ CONSTANTS
     Setback,         \* ticks a store clock step or failover takes off every lease
     \* --- what the environment may do ---
     AllowReboot, AllowWedge,
-    AllowLoss,       \* calls may fail: lost messages, partitions, agent crashes
-    StalePut,        \* an abandoned registration PUT may still be applied later
-    StaleKa,         \* an abandoned keepalive may still be applied later
+    AllowLoss,       \* calls may be lost: a broken connection, a process restart
+    StalePut,        \* a registration PUT whose connection broke, or whose
+                     \* agent restarted, may still be applied later
+    StaleKa,         \* a keepalive given up or lost may still be applied later
     AllowHeal,       \* faults may stop for good (the liveness configs)
     NodeCtlPrompt,   \* the node controller judges a node within the tick
     \* --- the safeguards; FALSE takes one away (the "teeth" configs) ---
@@ -71,13 +74,21 @@ InequalityOK == /\ Margin >= MarginNeeded
 FenceAt == TTL - Margin                 \* fence_at_ms - s
 RenewAfter == IF RenewRule = "old" THEN TTL \div 3
               ELSE Min(TTL \div 3, IF FenceAt > RenewSlack THEN FenceAt - RenewSlack ELSE 0)
-\* No agent that is not wedged gets older than this (see Urgent).
-AgeCap == FenceAt + StopTime + KillLatency + StepMax
-OvlCap == LostGrace + KillLatency + 1
+\* agent_io_timeout_ms: the bound on one server call of an agent that holds
+\* no lease (agent_http.zig: one request per connection, no retry).  It is
+\* 10 s in constants.zig, the same as lease_ttl_ms.  A call of an agent that
+\* holds a lease is capped at its fence time, which is earlier.
+IoTimeout == TTL
+\* No agent that is not wedged gets older than this (see Urgent), and no
+\* call is older.
+AgeCap == Max(FenceAt + StopTime + KillLatency + StepMax, IoTimeout)
+StopCap == StopGrace + KillLatency + StepMax + 1
+OvlCap == TTL + StopGrace + StopTime + KillLatency + 1
 ZombCap == StopTime + KillLatency + StepMax + SkewActual + 2
 
 ASSUME /\ TTL \in Nat /\ Margin \in Nat /\ TTL > Margin
        /\ NL \in Nat /\ NL >= 2
+       /\ StopGrace \in Nat
        /\ RenewRule \in {"new", "old"}
        /\ RequireInequality => InequalityOK
 
@@ -99,10 +110,13 @@ VARIABLES
     callL,      \* the lease the call names
     callAge,    \* agent-clock ticks since the call was sent
     pendOk,     \* the revision the served PUT made is still the current one
-    stale,      \* an abandoned request still in the network: [kind, l]
+    stale,      \* a request the agent no longer waits for, still on its
+                \* way to the store: [kind, l]
     cont,       \* [Agents -> [Slots -> {"none","run","rep","old"}]]: the
                 \* container of a slot's replica: none; running, not reported;
                 \* running, reported; running, its replica since replaced
+    stop,       \* [Agents -> [Slots -> 0..StopCap]]: 0, or 1 + the agent-clock
+                \* ticks since the pass sent TERM to the slot's container
     \* --- store ---
     left,       \* [Agents -> [Leases -> 0..TTL]]: time a lease has left
     keyL,       \* the lease /nodes/<node> is attached to, 0: the key is absent
@@ -110,7 +124,8 @@ VARIABLES
     statusCur,  \* the status was written for the current /nodes revision
     lostAge,    \* server-clock ticks since mark_lost
     asg,        \* /assigned/<node>/<replica> as pairs <<slot, node>>
-    obs,        \* /observed of a slot: None or [n, ten, asg]
+    obs,        \* [Agents -> [Slots -> None or [ten, asg]]]: the record
+                \* /observed/<node>/<replica> a node keeps of a slot's replica
     plan,       \* [Scheds -> None or [s, n, nodeOk, readyOk, freeOk]]
     \* --- environment and history ---
     healed, jumped,
@@ -119,7 +134,7 @@ VARIABLES
     bad         \* the kinds of transaction that must never commit, if any did
 
 agentVars == <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
-               callKind, callSt, callL, callAge, pendOk, stale, cont>>
+               callKind, callSt, callL, callAge, pendOk, stale, cont, stop>>
 storeVars == <<left, keyL, status, statusCur, lostAge, asg, obs, plan>>
 histVars  == <<healed, jumped, ovl, zomb, bad>>
 vars == <<agentVars, storeVars, histVars>>
@@ -129,8 +144,10 @@ HasCont(a) == \E s \in Slots : cont[a][s] # "none"
 Free(s) == \A n \in Agents : <<s, n>> \notin asg
 NodeReady(n) == keyL[n] # 0 /\ status[n] = "ready" /\ statusCur[n]
 \* authority.md section 3: tenure current, assignment current, node ready.
-Admissible(s) == /\ obs[s] # None
-                 /\ obs[s].ten /\ obs[s].asg /\ NodeReady(obs[s].n)
+Admissible(n, s) == /\ obs[n][s] # None
+                    /\ obs[n][s].ten /\ obs[n][s].asg /\ NodeReady(n)
+\* A container the pass stops: its replica is gone from the node.
+Stray(a, s) == cont[a][s] = "old" \/ (cont[a][s] # "none" /\ <<s, a>> \notin asg)
 
 Init ==
     /\ phase = [a \in Agents |-> "idle"]
@@ -148,13 +165,14 @@ Init ==
     /\ pendOk = [a \in Agents |-> FALSE]
     /\ stale = [a \in Agents |-> NoStale]
     /\ cont = [a \in Agents |-> [s \in Slots |-> "none"]]
+    /\ stop = [a \in Agents |-> [s \in Slots |-> 0]]
     /\ left = [a \in Agents |-> [l \in Leases |-> 0]]
     /\ keyL = [a \in Agents |-> 0]
     /\ status = [a \in Agents |-> "none"]
     /\ statusCur = [a \in Agents |-> FALSE]
     /\ lostAge = [a \in Agents |-> 0]
     /\ asg = {}
-    /\ obs = [s \in Slots |-> None]
+    /\ obs = [a \in Agents |-> [s \in Slots |-> None]]
     /\ plan = [k \in Scheds |-> None]
     /\ healed = FALSE
     /\ jumped = FALSE
@@ -170,9 +188,8 @@ Init ==
 KeyChanged(n) ==
     /\ tenureOk' = [tenureOk EXCEPT ![n] = FALSE]
     /\ statusCur' = [statusCur EXCEPT ![n] = FALSE]
-    /\ obs' = [s \in Slots |->
-                 IF obs[s] # None /\ obs[s].n = n
-                 THEN [obs[s] EXCEPT !.ten = FALSE] ELSE obs[s]]
+    /\ obs' = [obs EXCEPT ![n] = [s \in Slots |->
+                 IF @[s] # None THEN [@[s] EXCEPT !.ten = FALSE] ELSE None]]
     /\ plan' = [k \in Scheds |->
                  IF plan[k] # None /\ plan[k].n = n
                  THEN [plan[k] EXCEPT !.nodeOk = FALSE] ELSE plan[k]]
@@ -198,7 +215,7 @@ Expire(n) ==
     /\ KeyChanged(n)
     /\ pendOk' = [pendOk EXCEPT ![n] = FALSE]
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, callKind,
-                   callSt, callL, callAge, stale, cont, left, status,
+                   callSt, callL, callAge, stale, cont, stop, left, status,
                    lostAge, asg, histVars>>
 
 (***************************************************************************)
@@ -220,7 +237,7 @@ Register(a) ==
     /\ callAge' = [callAge EXCEPT ![a] = 0]
     /\ callLost' = [callLost EXCEPT ![a] = 0]
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, myLease, tenureOk,
-                   pendOk, stale, cont, keyL, status, statusCur, lostAge, asg,
+                   pendOk, stale, cont, stop, keyL, status, statusCur, lostAge, asg,
                    obs, plan, histVars>>
 
 \* The fence is looked at before the heartbeat (reconcile), so no renewal is
@@ -234,7 +251,7 @@ Renew(a) ==
     /\ callAge' = [callAge EXCEPT ![a] = 0]
     /\ callLost' = [callLost EXCEPT ![a] = 0]
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, myLease, tenureOk,
-                   pendOk, stale, cont, storeVars, histVars>>
+                   pendOk, stale, cont, stop, storeVars, histVars>>
 
 \* The server applies the call in flight.  The registration PUT carries no
 \* compare (agent_api.zig, register): it lands whatever the key holds.
@@ -253,7 +270,7 @@ Serve(a) ==
                 ELSE /\ left' = [left EXCEPT ![a][l] = TTL]
                      /\ UNCHANGED <<keyL, tenureOk, statusCur, obs, plan, pendOk>>
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, callKind,
-                   callL, callAge, stale, cont, status, lostAge, asg, histVars>>
+                   callL, callAge, stale, cont, stop, status, lostAge, asg, histVars>>
 
 \* The call is over: its variables go back to their idle values.
 CallDone(a) ==
@@ -264,25 +281,39 @@ CallDone(a) ==
     /\ callLost' = [callLost EXCEPT ![a] = 0]
     /\ pendOk' = [pendOk EXCEPT ![a] = FALSE]
 
-\* acknowledged: s becomes the send time of the request just answered.
-Ack(a) ==
-    /\ CanAct(a) /\ callKind[a] # "none" /\ callSt[a] = "ok"
-    /\ CallDone(a)
-    /\ age' = [age EXCEPT ![a] = callAge[a]]
-    /\ lost' = [lost EXCEPT ![a] = callLost[a]]
-    /\ IF callKind[a] = "put"
-       THEN /\ phase' = [phase EXCEPT ![a] = "held"]
-            /\ myLease' = [myLease EXCEPT ![a] = callL[a]]
-            /\ tenureOk' = [tenureOk EXCEPT ![a] = pendOk[a]]
-       ELSE UNCHANGED <<phase, myLease, tenureOk>>
-    /\ UNCHANGED <<wedged, killAge, stale, cont, storeVars, histVars>>
-
 \* The fence begins: TERM now, KILL at nominal + fence_stop_ms.
 FenceFrom(a, nominal) ==
     /\ phase' = [phase EXCEPT ![a] = "fencing"]
     /\ killAge' = [killAge EXCEPT ![a] = nominal + StopTime]
 
 Told(a) == zomb' = [zomb EXCEPT ![a] = IF HasCont(a) /\ @ = 0 THEN 1 ELSE @]
+
+\* acknowledged: s becomes the send time of the request just answered.
+\* After the PUT of a registration, the same step writes the node's store
+\* summary (agent.zig, publish_store: the lease is new to it), and that write
+\* compares /nodes/<node> at the tenure the PUT returned.  If the key was
+\* written again in between, the write is refused and the fence begins now.
+Ack(a) ==
+    /\ CanAct(a) /\ callKind[a] # "none" /\ callSt[a] = "ok"
+    /\ CallDone(a)
+    /\ age' = [age EXCEPT ![a] = callAge[a]]
+    /\ lost' = [lost EXCEPT ![a] = callLost[a]]
+    /\ IF callKind[a] = "put"
+       THEN /\ myLease' = [myLease EXCEPT ![a] = callL[a]]
+            /\ tenureOk' = [tenureOk EXCEPT ![a] = pendOk[a]]
+            /\ IF pendOk[a] \/ ~CompareTenure
+               THEN /\ phase' = [phase EXCEPT ![a] = "held"]
+                    /\ bad' = IF pendOk[a] THEN bad ELSE bad \cup {"stale_summary"}
+                    /\ UNCHANGED <<killAge, zomb>>
+               ELSE /\ Told(a)
+                    /\ IF FenceOnConflict
+                       THEN FenceFrom(a, callAge[a])
+                       ELSE \* tooth: the agent carries on as if it had landed
+                            /\ phase' = [phase EXCEPT ![a] = "held"]
+                            /\ UNCHANGED killAge
+                    /\ UNCHANGED bad
+       ELSE UNCHANGED <<phase, myLease, tenureOk, killAge, zomb, bad>>
+    /\ UNCHANGED <<wedged, stale, cont, stop, storeVars, healed, jumped, ovl>>
 
 \* LeaseNotFound.  For a keepalive: "the lease has ended, so the server will
 \* take the node for lost: stop at once".  For a PUT: the step fails and the
@@ -303,10 +334,11 @@ Nack(a) ==
                     /\ lost' = [lost EXCEPT ![a] = 0]
                     /\ UNCHANGED killAge
        ELSE UNCHANGED <<phase, killAge, myLease, tenureOk, age, lost, zomb>>
-    /\ UNCHANGED <<wedged, stale, cont, storeVars, healed, jumped, ovl, bad>>
+    /\ UNCHANGED <<wedged, stale, cont, stop, storeVars, healed, jumped, ovl, bad>>
 
-\* What becomes of a call the agent gives up: the reply is lost, the request
-\* is lost, or the request is still on its way and may be applied later.
+\* What becomes of a call the agent no longer waits for: the reply is lost,
+\* the request is lost, or the request is still on its way and may be applied
+\* later.
 Abandon(a) ==
     /\ CallDone(a)
     /\ \/ UNCHANGED stale
@@ -314,16 +346,35 @@ Abandon(a) ==
           /\ (callKind[a] = "put" /\ StalePut) \/ (callKind[a] = "ka" /\ StaleKa)
           /\ stale' = [stale EXCEPT ![a] = [kind |-> callKind[a], l |-> callL[a]]]
 
-\* A call fails: the network lost it, the agent process died with it, or it
-\* reached the cap every server call has, the fence time (agent.zig,
-\* calls_deadline_ms).
-CallFail(a) ==
+\* The agent gives a call up at its deadline.  A call of an agent that holds
+\* a lease is capped at the fence time (agent.zig, calls_deadline_ms); such a
+\* call is a keepalive, and the request may still be applied later.  Any
+\* other call, the registration PUT among them, runs IoTimeout, and by then
+\* the lease the PUT names has ended (TimedOutPutIsDead, below): a PUT that
+\* timed out cannot land, so none is left in flight.
+CallTimeout(a) ==
     /\ callKind[a] # "none"
-    /\ \/ (AllowLoss /\ ~healed /\ a \in Faulty)
-       \/ (phase[a] = "held" /\ age[a] >= FenceAt /\ callSt[a] = "req")
+    /\ \/ (phase[a] = "held" /\ age[a] >= FenceAt /\ callSt[a] = "req")
+       \/ callAge[a] >= IoTimeout
+    /\ IF callKind[a] = "ka" THEN Abandon(a)
+       ELSE CallDone(a) /\ UNCHANGED stale
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, myLease, tenureOk, cont,
+                   stop, storeVars, histVars>>
+
+\* A fault: the agent stops waiting before the deadline, because the
+\* connection broke or because the agent process restarted with the call in
+\* flight.  The server may already hold the request (one thread per
+\* connection, server_http.zig) and apply it later.  This, and a reboot, are
+\* the only ways a registration PUT is left in flight behind its agent.
+\* lease.json keeps phase, age, lease, tenure and kill time and containers
+\* run on, so the restart itself changes nothing else here; README.md says
+\* what it leaves out.
+CallLost(a) ==
+    /\ callKind[a] # "none"
+    /\ AllowLoss /\ ~healed /\ a \in Faulty
     /\ Abandon(a)
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, myLease, tenureOk, cont,
-                   storeVars, histVars>>
+                   stop, storeVars, histVars>>
 
 ServeStale(a) ==
     /\ stale[a].kind # "none"
@@ -340,13 +391,13 @@ ServeStale(a) ==
     /\ pendOk' = [pendOk EXCEPT ![a] =
                     @ /\ ~(stale[a].kind = "put" /\ left[a][stale[a].l] > 0)]
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, callKind,
-                   callSt, callL, callAge, cont, status, lostAge, asg, histVars>>
+                   callSt, callL, callAge, cont, stop, status, lostAge, asg, histVars>>
 
 DropStale(a) ==
     /\ stale[a].kind # "none"
     /\ stale' = [stale EXCEPT ![a] = NoStale]
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
-                   callKind, callSt, callL, callAge, pendOk, cont, storeVars,
+                   callKind, callSt, callL, callAge, pendOk, cont, stop, storeVars,
                    histVars>>
 
 (***************************************************************************)
@@ -359,13 +410,14 @@ TimerFence(a) ==
     /\ age[a] >= FenceAt
     /\ FenceFrom(a, FenceAt)
     /\ UNCHANGED <<wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
-                   callL, callAge, pendOk, stale, cont, storeVars, histVars>>
+                   callL, callAge, pendOk, stale, cont, stop, storeVars, histVars>>
 
 \* A container ends once the fence has begun: on TERM, or on KILL.  The Tick
 \* action is what makes it end by killAge + KillLatency.
 ContExit(a, s) ==
     /\ ~wedged[a] /\ phase[a] = "fencing" /\ cont[a][s] # "none"
     /\ cont' = [cont EXCEPT ![a][s] = "none"]
+    /\ stop' = [stop EXCEPT ![a][s] = 0]
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                    callKind, callSt, callL, callAge, pendOk, stale, storeVars,
                    histVars>>
@@ -382,7 +434,7 @@ Fenced(a) ==
     /\ zomb' = [zomb EXCEPT ![a] = 0]
     /\ lost' = [lost EXCEPT ![a] = 0]
     /\ UNCHANGED <<wedged, callLost, callKind, callSt, callL, callAge, pendOk,
-                   stale, cont, storeVars, healed, jumped, ovl, bad>>
+                   stale, cont, stop, storeVars, healed, jumped, ovl, bad>>
 
 (***************************************************************************)
 (* The agent: the pass (agent.zig, Pass).                                  *)
@@ -393,15 +445,27 @@ InPass(a) == /\ CanAct(a) /\ phase[a] = "held" /\ callKind[a] = "none"
 Start(a, s) ==
     /\ InPass(a) /\ <<s, a>> \in asg /\ cont[a][s] = "none"
     /\ cont' = [cont EXCEPT ![a][s] = "run"]
-    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
+    /\ UNCHANGED <<stop, phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                    callKind, callSt, callL, callAge, pendOk, stale, storeVars,
                    histVars>>
 
-\* A container whose replica the node is no longer assigned is stopped.
-StopStray(a, s) ==
-    /\ InPass(a)
-    /\ cont[a][s] = "old" \/ (cont[a][s] # "none" /\ <<s, a>> \notin asg)
+\* A container whose replica the node is no longer assigned is stopped
+\* (agent.zig: orphan_containers, stop_listing): TERM in the pass that sees
+\* it, KILL by a later pass once stop_grace_ms has gone by.  This is not a
+\* fence: the grace is stop_grace_ms, not fence_stop_ms.
+StopTerm(a, s) ==
+    /\ InPass(a) /\ Stray(a, s) /\ stop[a][s] = 0
+    /\ stop' = [stop EXCEPT ![a][s] = 1]
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
+                   callKind, callSt, callL, callAge, pendOk, stale, cont, storeVars,
+                   histVars>>
+
+\* The container ends: on the TERM, at any time after it, or on the KILL.
+\* Urgent is what makes it end by StopGrace + KillLatency.
+StrayExit(a, s) ==
+    /\ ~wedged[a] /\ stop[a][s] > 0 /\ cont[a][s] # "none"
     /\ cont' = [cont EXCEPT ![a][s] = "none"]
+    /\ stop' = [stop EXCEPT ![a][s] = 0]
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                    callKind, callSt, callL, callAge, pendOk, stale, storeVars,
                    histVars>>
@@ -412,8 +476,8 @@ StopStray(a, s) ==
 Report(a, s) ==
     /\ InPass(a) /\ cont[a][s] = "run"
     /\ IF tenureOk[a] \/ ~CompareTenure
-       THEN /\ obs' = [obs EXCEPT ![s] = [n |-> a, ten |-> tenureOk[a],
-                                          asg |-> <<s, a>> \in asg]]
+       THEN /\ obs' = [obs EXCEPT ![a][s] = [ten |-> tenureOk[a],
+                                             asg |-> <<s, a>> \in asg]]
             /\ cont' = [cont EXCEPT ![a][s] = "rep"]
             /\ bad' = IF tenureOk[a] THEN bad ELSE bad \cup {"stale_observation"}
             /\ UNCHANGED <<phase, killAge, zomb>>
@@ -425,17 +489,33 @@ Report(a, s) ==
                     /\ UNCHANGED <<phase, killAge>>
             /\ UNCHANGED <<obs, bad>>
     /\ UNCHANGED <<wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
-                   callL, callAge, pendOk, stale, left, keyL, status, statusCur,
-                   lostAge, asg, plan, healed, jumped, ovl>>
+                   callL, callAge, pendOk, stale, stop, left, keyL, status,
+                   statusCur, lostAge, asg, plan, healed, jumped, ovl>>
+
+\* The record of a replica that is gone from the node is deleted once its
+\* container has stopped (agent.zig, orphan_records).  The delete is an
+\* observed write like any other: compared, and a conflict fences.
+ForgetDue(a, s) == obs[a][s] # None /\ cont[a][s] = "none" /\ <<s, a>> \notin asg
+Forget(a, s) ==
+    /\ InPass(a) /\ ForgetDue(a, s)
+    /\ IF tenureOk[a] \/ ~CompareTenure
+       THEN /\ obs' = [obs EXCEPT ![a][s] = None]
+            /\ bad' = IF tenureOk[a] THEN bad ELSE bad \cup {"stale_observation"}
+            /\ UNCHANGED <<phase, killAge, zomb>>
+       ELSE /\ Told(a)
+            /\ IF FenceOnConflict THEN FenceFrom(a, age[a])
+               ELSE UNCHANGED <<phase, killAge>>
+            /\ UNCHANGED <<obs, bad>>
+    /\ UNCHANGED <<wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
+                   callL, callAge, pendOk, stale, cont, stop, left, keyL, status,
+                   statusCur, lostAge, asg, plan, healed, jumped, ovl>>
 
 (***************************************************************************)
 (* Agent faults.                                                           *)
 (***************************************************************************)
-\* A crash of the agent process is not a separate action.  lease.json keeps
-\* phase, age, lease, tenure and kill time, containers run on, and restore
-\* reads the file back: what a crash loses is the call in flight, which is
-\* CallFail, and time, which is the agent not acting.  An outage that lets a
-\* deadline pass is a wedge (Urgent, below).
+\* A restart of the agent process is CallLost, above, for the call it had
+\* in flight, and time, which is the agent not acting.  An outage that lets
+\* a deadline pass is a wedge (Urgent, below).
 
 \* The machine restarts: containers are gone, the boot id differs, the kept
 \* lease is not trusted and nothing is left to fence.
@@ -449,6 +529,7 @@ Reboot(a) ==
     /\ lost' = [lost EXCEPT ![a] = 0]
     /\ killAge' = [killAge EXCEPT ![a] = 0]
     /\ cont' = [cont EXCEPT ![a] = [s \in Slots |-> "none"]]
+    /\ stop' = [stop EXCEPT ![a] = [s \in Slots |-> 0]]
     /\ zomb' = [zomb EXCEPT ![a] = 0]
     /\ IF callKind[a] # "none" THEN Abandon(a)
        ELSE UNCHANGED <<callKind, callSt, callL, callAge, callLost, pendOk, stale>>
@@ -458,7 +539,7 @@ Wedge(a) ==
     /\ AllowWedge /\ ~healed /\ ~wedged[a] /\ a \in Faulty
     /\ wedged' = [wedged EXCEPT ![a] = TRUE]
     /\ UNCHANGED <<phase, age, killAge, lost, callLost, myLease, tenureOk, callKind,
-                   callSt, callL, callAge, pendOk, stale, cont, storeVars, histVars>>
+                   callSt, callL, callAge, pendOk, stale, cont, stop, storeVars, histVars>>
 
 (***************************************************************************)
 (* The server: node controller, replica controller, scheduler.  A          *)
@@ -489,14 +570,15 @@ Replace(s, n) ==
     /\ status[n] = "lost" /\ keyL[n] = 0
     /\ UseLostGrace => lostAge[n] >= LostGrace
     /\ asg' = asg \ {<<s, n>>}
-    /\ obs' = [obs EXCEPT ![s] = IF @ = None THEN None ELSE [@ EXCEPT !.asg = FALSE]]
+    /\ obs' = [a \in Agents |->
+                 [obs[a] EXCEPT ![s] = IF @ = None THEN None ELSE [@ EXCEPT !.asg = FALSE]]]
     /\ cont' = [a \in Agents |->
                   [cont[a] EXCEPT ![s] = IF @ = "none" THEN "none" ELSE "old"]]
     /\ plan' = [k \in Scheds |->
                   IF plan[k] # None /\ plan[k].s = s
                   THEN [plan[k] EXCEPT !.freeOk = FALSE] ELSE plan[k]]
     /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
-                   callKind, callSt, callL, callAge, pendOk, stale, left, keyL,
+                   callKind, callSt, callL, callAge, pendOk, stale, stop, left, keyL,
                    status, statusCur, lostAge, histVars>>
 
 Plan(k, s, n) ==
@@ -529,11 +611,11 @@ Commit(k) ==
     /\ UNCHANGED <<agentVars, left, keyL, status, statusCur, lostAge, obs, healed,
                    jumped, ovl, zomb>>
 
-\* A controller acts on an observation (counts the replica as running).  It
+\* A controller acts on a node's record (counts the replica as running).  It
 \* may only if the observation is admissible (replica_controller.zig,
 \* admissible).  Only the forbidden case changes the state.
-Decide(s) ==
-    /\ ~CheckAdmissible /\ obs[s] # None /\ ~Admissible(s)
+Decide(n, s) ==
+    /\ ~CheckAdmissible /\ obs[n][s] # None /\ ~Admissible(n, s)
     /\ "inadmissible_cited" \notin bad
     /\ bad' = bad \cup {"inadmissible_cited"}
     /\ UNCHANGED <<agentVars, storeVars, healed, jumped, ovl, zomb>>
@@ -567,6 +649,15 @@ PassDue(a) ==
     /\ phase[a] = "held" /\ callKind[a] = "none" /\ age[a] < FenceAt + StepMax
     /\ \E s \in Slots : \/ (<<s, a>> \in asg /\ cont[a][s] = "none")
                         \/ cont[a][s] = "run"
+                        \/ (Stray(a, s) /\ stop[a][s] = 0)
+                        \/ (ForgetDue(a, s)
+                            /\ (tenureOk[a] \/ FenceOnConflict \/ ~CompareTenure))
+\* The pass that sends KILL to a container it sent TERM is due, or the KILL
+\* has had its time.  A keepalive that hangs holds the pass up (heartbeat
+\* comes first in reconcile), until the fence takes over.
+StopDue(a) ==
+    /\ phase[a] = "held" /\ callKind[a] = "none"
+    /\ \E s \in Slots : stop[a][s] > StopGrace + KillLatency + StepMax
 
 Urgent(a) ==
     /\ ~wedged[a]
@@ -576,8 +667,10 @@ Urgent(a) ==
        \/ (phase[a] = "held" /\ callKind[a] = "none"               \* renew
            /\ age[a] >= RenewAfter + StepMax)
        \/ PassDue(a)                                              \* the pass
+       \/ StopDue(a)
        \/ ((healed \/ a \notin Faulty) /\ callKind[a] # "none"       \* reply
            /\ callAge[a] >= HealedDelay)
+       \/ (callKind[a] # "none" /\ callAge[a] >= IoTimeout)        \* timeout
 
 \* skip: the one agent, if any, whose clock loses this tick.
 NodeCtlDue(n) == \/ (keyL[n] # 0 /\ ~(status[n] = "ready" /\ statusCur[n]))
@@ -609,6 +702,9 @@ Tick(skip) ==
     /\ lostAge' = [n \in Agents |->
                      IF status[n] = "lost" THEN Min(lostAge[n] + 1, LostGrace)
                      ELSE 0]
+    /\ stop' = [a \in Agents |-> [s \in Slots |->
+                  IF stop[a][s] > 0 /\ a # skip /\ ~wedged[a]
+                  THEN Min(stop[a][s] + 1, StopCap) ELSE stop[a][s]]]
     /\ ovl' = [s \in Slots |->
                  IF Cardinality({a \in Agents : cont[a][s] # "none"}) >= 2
                  THEN Min(ovl[s] + 1, OvlCap) ELSE 0]
@@ -621,7 +717,8 @@ Tick(skip) ==
 
 AgentStep(a) ==
     \/ Register(a) \/ Renew(a) \/ Ack(a) \/ Nack(a) \/ TimerFence(a) \/ Fenced(a)
-    \/ \E s \in Slots : Start(a, s) \/ StopStray(a, s) \/ Report(a, s) \/ ContExit(a, s)
+    \/ \E s \in Slots : \/ Start(a, s) \/ Report(a, s) \/ Forget(a, s)
+                        \/ StopTerm(a, s) \/ StrayExit(a, s) \/ ContExit(a, s)
 NetStep(a) == Serve(a) \/ ServeStale(a) \/ DropStale(a)
 ServerStep ==
     \/ \E n \in Agents : Expire(n) \/ MarkReady(n) \/ MarkLost(n)
@@ -629,13 +726,13 @@ ServerStep ==
     \/ \E k \in Scheds, s \in Slots, n \in Agents : Plan(k, s, n)
     \/ \E k \in Scheds : Commit(k)
 Fault ==
-    \/ \E a \in Agents : CallFail(a) \/ Reboot(a) \/ Wedge(a)
-    \/ \E s \in Slots : Decide(s)
+    \/ \E a \in Agents : CallLost(a) \/ Reboot(a) \/ Wedge(a)
+    \/ \E n \in Agents, s \in Slots : Decide(n, s)
     \/ StoreSetback
     \/ Heal
 
 Next ==
-    \/ \E a \in Agents : AgentStep(a) \/ NetStep(a)
+    \/ \E a \in Agents : AgentStep(a) \/ CallTimeout(a) \/ NetStep(a)
     \/ ServerStep
     \/ Fault
     \/ \E skip \in Agents \cup {None} : Tick(skip)
@@ -648,7 +745,7 @@ Fairness ==
     /\ \A a \in Agents :
           /\ WF_vars(AgentStep(a))
           /\ WF_vars(NetStep(a))
-          /\ WF_vars(CallFail(a) /\ healed)
+          /\ WF_vars(CallTimeout(a))
     /\ \A n \in Agents : WF_vars(Expire(n)) /\ WF_vars(MarkReady(n)) /\ WF_vars(MarkLost(n))
     /\ WF_vars(\E s \in Slots, n \in Agents : Replace(s, n))
     /\ \A k \in Scheds : WF_vars(\E s \in Slots, n \in Agents : Plan(k, s, n))
@@ -668,6 +765,8 @@ TypeOK ==
     /\ callKind \in [Agents -> {"none", "put", "ka"}]
     /\ callSt \in [Agents -> {"req", "ok", "nf"}]
     /\ cont \in [Agents -> [Slots -> {"none", "run", "rep", "old"}]]
+    /\ stop \in [Agents -> [Slots -> 0..StopCap]]
+    /\ \A a \in Agents, s \in Slots : stop[a][s] > 0 => cont[a][s] # "none"
     /\ left \in [Agents -> [Leases -> 0..TTL]]
     /\ status \in [Agents -> {"none", "ready", "lost"}]
     /\ asg \subseteq (Slots \X Agents)
@@ -676,13 +775,24 @@ TypeOK ==
 LeaseSlotsSuffice ==
     \A a \in Agents : (phase[a] = "idle" /\ callKind[a] = "none") => FreeLeases(a) # {}
 
+\* Why a registration PUT that timed out cannot land: when the agent gives a
+\* registration PUT up at IoTimeout, the lease the PUT names has ended, so
+\* the store would refuse it (store_postgres.zig, check_leases).
+TimedOutPutIsDead ==
+    \A a \in Agents : (callKind[a] = "put" /\ callAge[a] >= IoTimeout)
+                          => left[a][callL[a]] = 0
+
 \* I1a. Each replica id has at most one assignment, and at most one tenure
-\* under which an observation of it is admissible.
+\* under which an observation of it is admissible.  Every node keeps its own
+\* record of a slot, so this is over all of them: at most one node's record
+\* is admissible, and it is the record of the node the slot is assigned to,
+\* under a registration that exists.
 I1a_OneAssignment ==
     \A s \in Slots : Cardinality({n \in Agents : <<s, n>> \in asg}) <= 1
 I1a_OneAdmissibleTenure ==
-    \A s \in Slots : Admissible(s) => /\ <<s, obs[s].n>> \in asg
-                                      /\ keyL[obs[s].n] # 0
+    \A s \in Slots :
+        /\ Cardinality({n \in Agents : Admissible(n, s)}) <= 1
+        /\ \A n \in Agents : Admissible(n, s) => (<<s, n>> \in asg /\ keyL[n] # 0)
 
 \* I1b, as the arithmetic of section 3 gives it: the agent has finished
 \* stopping before any replacement is placed, so a slot's work never runs on
@@ -692,9 +802,13 @@ I1b_NoOverlap ==
 \* I1b, as section 4 states it: not for longer than lost_grace_ms plus kill
 \* latency.
 I1b_Window == \A s \in Slots : ovl[s] <= LostGrace + KillLatency
+\* Not a property: a probe.  Its counterexample is a run in which an overlap
+\* lasts the whole of stop_grace_ms plus the kill latency.
+OverlapShorterThanStopGrace == \A s \in Slots : ovl[s] < StopGrace + KillLatency
 
 \* I2. No transaction commits whose tenure or placement epoch was superseded.
-I2_NoStaleCommit == bad \cap {"stale_observation", "stale_placement"} = {}
+I2_NoStaleCommit ==
+    bad \cap {"stale_observation", "stale_summary", "stale_placement"} = {}
 \* I3. No decision cites an inadmissible observation.
 I3_NoInadmissibleCause == "inadmissible_cited" \notin bad
 \* I7. No placement onto a node that is not ready.
