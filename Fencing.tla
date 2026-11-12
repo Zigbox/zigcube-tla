@@ -21,6 +21,7 @@ EXTENDS Naturals, FiniteSets, TLC
 
 CONSTANTS
     Agents,          \* the nodes; one agent each
+    Faulty,          \* the agents the environment's faults may touch
     Slots,           \* replica slots: one unit of work that must run once
     Scheds,          \* scheduler instances (2 = a deposed leader still acting)
     None,            \* a model value
@@ -41,10 +42,12 @@ CONSTANTS
     HealedDelay,     \* once healed, a call is answered within this many ticks
     Setback,         \* ticks a store clock step or failover takes off every lease
     \* --- what the environment may do ---
-    AllowCrash, AllowReboot, AllowWedge, AllowLoss,
+    AllowReboot, AllowWedge,
+    AllowLoss,       \* calls may fail: lost messages, partitions, agent crashes
     StalePut,        \* an abandoned registration PUT may still be applied later
     StaleKa,         \* an abandoned keepalive may still be applied later
     AllowHeal,       \* faults may stop for good (the liveness configs)
+    NodeCtlPrompt,   \* the node controller judges a node within the tick
     \* --- the safeguards; FALSE takes one away (the "teeth" configs) ---
     RequireInequality,  \* refuse constants that fail fencing.inequality_problem
     FenceOnConflict,    \* a refused observed write fences at once
@@ -83,7 +86,6 @@ Leases == 1..NL
 VARIABLES
     \* --- agent ---
     phase,      \* [Agents -> {"idle","held","fencing"}]; persisted in lease.json
-    up,         \* the agent process runs
     wedged,     \* the node is frozen: nothing on it moves, not even a KILL
     age,        \* agent-clock ticks since s, the send time of the last
                 \* acknowledged request; persisted
@@ -116,7 +118,7 @@ VARIABLES
     zomb,       \* ticks since an agent with containers was told its tenure ended
     bad         \* the kinds of transaction that must never commit, if any did
 
-agentVars == <<phase, up, wedged, age, killAge, lost, callLost, myLease, tenureOk,
+agentVars == <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                callKind, callSt, callL, callAge, pendOk, stale, cont>>
 storeVars == <<left, keyL, status, statusCur, lostAge, asg, obs, plan>>
 histVars  == <<healed, jumped, ovl, zomb, bad>>
@@ -132,7 +134,6 @@ Admissible(s) == /\ obs[s] # None
 
 Init ==
     /\ phase = [a \in Agents |-> "idle"]
-    /\ up = [a \in Agents |-> TRUE]
     /\ wedged = [a \in Agents |-> FALSE]
     /\ age = [a \in Agents |-> 0]
     /\ killAge = [a \in Agents |-> 0]
@@ -195,14 +196,15 @@ Expire(n) ==
     /\ keyL[n] # 0 /\ left[n][keyL[n]] = 0
     /\ keyL' = [keyL EXCEPT ![n] = 0]
     /\ KeyChanged(n)
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, callKind,
-                   callSt, callL, callAge, pendOk, stale, cont, left, status,
+    /\ pendOk' = [pendOk EXCEPT ![n] = FALSE]
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, callKind,
+                   callSt, callL, callAge, stale, cont, left, status,
                    lostAge, asg, histVars>>
 
 (***************************************************************************)
 (* The agent: registration and renewal (agent.zig, heartbeat).             *)
 (***************************************************************************)
-CanAct(a) == up[a] /\ ~wedged[a]
+CanAct(a) == ~wedged[a]
 
 \* lease_grant, then the PUT of /nodes/<node> on that lease.  The grant is
 \* taken as immediate; `sent` is read before it, so the lease runs TTL from
@@ -217,7 +219,7 @@ Register(a) ==
     /\ callSt' = [callSt EXCEPT ![a] = "req"]
     /\ callAge' = [callAge EXCEPT ![a] = 0]
     /\ callLost' = [callLost EXCEPT ![a] = 0]
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, myLease, tenureOk,
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, myLease, tenureOk,
                    pendOk, stale, cont, keyL, status, statusCur, lostAge, asg,
                    obs, plan, histVars>>
 
@@ -231,7 +233,7 @@ Renew(a) ==
     /\ callL' = [callL EXCEPT ![a] = myLease[a]]
     /\ callAge' = [callAge EXCEPT ![a] = 0]
     /\ callLost' = [callLost EXCEPT ![a] = 0]
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, myLease, tenureOk,
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, myLease, tenureOk,
                    pendOk, stale, cont, storeVars, histVars>>
 
 \* The server applies the call in flight.  The registration PUT carries no
@@ -250,13 +252,22 @@ Serve(a) ==
                      /\ UNCHANGED left
                 ELSE /\ left' = [left EXCEPT ![a][l] = TTL]
                      /\ UNCHANGED <<keyL, tenureOk, statusCur, obs, plan, pendOk>>
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, callKind,
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, callKind,
                    callL, callAge, stale, cont, status, lostAge, asg, histVars>>
+
+\* The call is over: its variables go back to their idle values.
+CallDone(a) ==
+    /\ callKind' = [callKind EXCEPT ![a] = "none"]
+    /\ callSt' = [callSt EXCEPT ![a] = "req"]
+    /\ callL' = [callL EXCEPT ![a] = 0]
+    /\ callAge' = [callAge EXCEPT ![a] = 0]
+    /\ callLost' = [callLost EXCEPT ![a] = 0]
+    /\ pendOk' = [pendOk EXCEPT ![a] = FALSE]
 
 \* acknowledged: s becomes the send time of the request just answered.
 Ack(a) ==
     /\ CanAct(a) /\ callKind[a] # "none" /\ callSt[a] = "ok"
-    /\ callKind' = [callKind EXCEPT ![a] = "none"]
+    /\ CallDone(a)
     /\ age' = [age EXCEPT ![a] = callAge[a]]
     /\ lost' = [lost EXCEPT ![a] = callLost[a]]
     /\ IF callKind[a] = "put"
@@ -264,8 +275,7 @@ Ack(a) ==
             /\ myLease' = [myLease EXCEPT ![a] = callL[a]]
             /\ tenureOk' = [tenureOk EXCEPT ![a] = pendOk[a]]
        ELSE UNCHANGED <<phase, myLease, tenureOk>>
-    /\ UNCHANGED <<up, wedged, killAge, callLost, callSt, callL, callAge, pendOk,
-                   stale, cont, storeVars, histVars>>
+    /\ UNCHANGED <<wedged, killAge, stale, cont, storeVars, histVars>>
 
 \* The fence begins: TERM now, KILL at nominal + fence_stop_ms.
 FenceFrom(a, nominal) ==
@@ -279,60 +289,63 @@ Told(a) == zomb' = [zomb EXCEPT ![a] = IF HasCont(a) /\ @ = 0 THEN 1 ELSE @]
 \* next one grants a new lease.
 Nack(a) ==
     /\ CanAct(a) /\ callKind[a] # "none" /\ callSt[a] = "nf"
-    /\ callKind' = [callKind EXCEPT ![a] = "none"]
+    /\ CallDone(a)
     /\ IF callKind[a] = "ka"
        THEN /\ Told(a)
             /\ IF FenceOnLeaseGone
                THEN /\ FenceFrom(a, age[a] - Min(callAge[a], age[a]))
-                    /\ UNCHANGED <<myLease, tenureOk>>
+                    /\ UNCHANGED <<myLease, tenureOk, age, lost>>
                ELSE \* tooth: register again with the containers still running
                     /\ phase' = [phase EXCEPT ![a] = "idle"]
                     /\ myLease' = [myLease EXCEPT ![a] = 0]
                     /\ tenureOk' = [tenureOk EXCEPT ![a] = FALSE]
+                    /\ age' = [age EXCEPT ![a] = 0]
+                    /\ lost' = [lost EXCEPT ![a] = 0]
                     /\ UNCHANGED killAge
-       ELSE UNCHANGED <<phase, killAge, myLease, tenureOk, zomb>>
-    /\ UNCHANGED <<up, wedged, age, lost, callLost, callSt, callL, callAge, pendOk,
-                   stale, cont, storeVars, healed, jumped, ovl, bad>>
+       ELSE UNCHANGED <<phase, killAge, myLease, tenureOk, age, lost, zomb>>
+    /\ UNCHANGED <<wedged, stale, cont, storeVars, healed, jumped, ovl, bad>>
 
 \* What becomes of a call the agent gives up: the reply is lost, the request
 \* is lost, or the request is still on its way and may be applied later.
 Abandon(a) ==
-    /\ callKind' = [callKind EXCEPT ![a] = "none"]
+    /\ CallDone(a)
     /\ \/ UNCHANGED stale
        \/ /\ callSt[a] = "req" /\ stale[a].kind = "none" /\ ~healed
           /\ (callKind[a] = "put" /\ StalePut) \/ (callKind[a] = "ka" /\ StaleKa)
           /\ stale' = [stale EXCEPT ![a] = [kind |-> callKind[a], l |-> callL[a]]]
 
-\* A call fails: the network lost it, or it reached the cap every server call
-\* has, the fence time (agent.zig, calls_deadline_ms).
+\* A call fails: the network lost it, the agent process died with it, or it
+\* reached the cap every server call has, the fence time (agent.zig,
+\* calls_deadline_ms).
 CallFail(a) ==
     /\ callKind[a] # "none"
-    /\ \/ (AllowLoss /\ ~healed)
+    /\ \/ (AllowLoss /\ ~healed /\ a \in Faulty)
        \/ (phase[a] = "held" /\ age[a] >= FenceAt /\ callSt[a] = "req")
     /\ Abandon(a)
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, tenureOk,
-                   callSt, callL, callAge, pendOk, cont, storeVars, histVars>>
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, myLease, tenureOk, cont,
+                   storeVars, histVars>>
 
 ServeStale(a) ==
     /\ stale[a].kind # "none"
     /\ stale' = [stale EXCEPT ![a] = NoStale]
     /\ LET l == stale[a].l IN
         IF left[a][l] = 0
-        THEN UNCHANGED <<left, keyL, tenureOk, statusCur, obs, plan, pendOk>>
+        THEN UNCHANGED <<left, keyL, tenureOk, statusCur, obs, plan>>
         ELSE IF stale[a].kind = "put"
              THEN /\ keyL' = [keyL EXCEPT ![a] = l]
                   /\ KeyChanged(a)
-                  /\ pendOk' = [pendOk EXCEPT ![a] = FALSE]
                   /\ UNCHANGED left
              ELSE /\ left' = [left EXCEPT ![a][l] = TTL]
-                  /\ UNCHANGED <<keyL, tenureOk, statusCur, obs, plan, pendOk>>
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, callKind,
+                  /\ UNCHANGED <<keyL, tenureOk, statusCur, obs, plan>>
+    /\ pendOk' = [pendOk EXCEPT ![a] =
+                    @ /\ ~(stale[a].kind = "put" /\ left[a][stale[a].l] > 0)]
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, callKind,
                    callSt, callL, callAge, cont, status, lostAge, asg, histVars>>
 
 DropStale(a) ==
     /\ stale[a].kind # "none"
     /\ stale' = [stale EXCEPT ![a] = NoStale]
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, tenureOk,
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                    callKind, callSt, callL, callAge, pendOk, cont, storeVars,
                    histVars>>
 
@@ -345,7 +358,7 @@ TimerFence(a) ==
     /\ CanAct(a) /\ phase[a] = "held" /\ callKind[a] = "none"
     /\ age[a] >= FenceAt
     /\ FenceFrom(a, FenceAt)
-    /\ UNCHANGED <<up, wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
+    /\ UNCHANGED <<wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
                    callL, callAge, pendOk, stale, cont, storeVars, histVars>>
 
 \* A container ends once the fence has begun: on TERM, or on KILL.  The Tick
@@ -353,7 +366,7 @@ TimerFence(a) ==
 ContExit(a, s) ==
     /\ ~wedged[a] /\ phase[a] = "fencing" /\ cont[a][s] # "none"
     /\ cont' = [cont EXCEPT ![a][s] = "none"]
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, tenureOk,
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                    callKind, callSt, callL, callAge, pendOk, stale, storeVars,
                    histVars>>
 
@@ -368,7 +381,7 @@ Fenced(a) ==
     /\ killAge' = [killAge EXCEPT ![a] = 0]
     /\ zomb' = [zomb EXCEPT ![a] = 0]
     /\ lost' = [lost EXCEPT ![a] = 0]
-    /\ UNCHANGED <<up, wedged, callLost, callKind, callSt, callL, callAge, pendOk,
+    /\ UNCHANGED <<wedged, callLost, callKind, callSt, callL, callAge, pendOk,
                    stale, cont, storeVars, healed, jumped, ovl, bad>>
 
 (***************************************************************************)
@@ -380,7 +393,7 @@ InPass(a) == /\ CanAct(a) /\ phase[a] = "held" /\ callKind[a] = "none"
 Start(a, s) ==
     /\ InPass(a) /\ <<s, a>> \in asg /\ cont[a][s] = "none"
     /\ cont' = [cont EXCEPT ![a][s] = "run"]
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, tenureOk,
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                    callKind, callSt, callL, callAge, pendOk, stale, storeVars,
                    histVars>>
 
@@ -389,7 +402,7 @@ StopStray(a, s) ==
     /\ InPass(a)
     /\ cont[a][s] = "old" \/ (cont[a][s] # "none" /\ <<s, a>> \notin asg)
     /\ cont' = [cont EXCEPT ![a][s] = "none"]
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, tenureOk,
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                    callKind, callSt, callL, callAge, pendOk, stale, storeVars,
                    histVars>>
 
@@ -409,51 +422,40 @@ Report(a, s) ==
                THEN FenceFrom(a, age[a])
                ELSE UNCHANGED <<phase, killAge>>
             /\ UNCHANGED <<obs, cont, bad>>
-    /\ UNCHANGED <<up, wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
+    /\ UNCHANGED <<wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
                    callL, callAge, pendOk, stale, left, keyL, status, statusCur,
                    lostAge, asg, plan, healed, jumped, ovl>>
 
 (***************************************************************************)
 (* Agent faults.                                                           *)
 (***************************************************************************)
-\* The process dies; containers run on; lease.json keeps phase, age, lease,
-\* tenure and kill time.  Restart reads it back (restore).  Tick lets no
-\* deadline pass while the process is down: a longer outage is a wedge.
-Crash(a) ==
-    /\ AllowCrash /\ ~healed /\ up[a] /\ ~wedged[a]
-    /\ up' = [up EXCEPT ![a] = FALSE]
-    /\ IF callKind[a] # "none" THEN Abandon(a) ELSE UNCHANGED <<callKind, stale>>
-    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
-                   callSt, callL, callAge, pendOk, cont, storeVars, histVars>>
-
-Restart(a) ==
-    /\ ~up[a] /\ ~wedged[a]
-    /\ up' = [up EXCEPT ![a] = TRUE]
-    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
-                   callKind, callSt, callL, callAge, pendOk, stale, cont, storeVars,
-                   histVars>>
+\* A crash of the agent process is not a separate action.  lease.json keeps
+\* phase, age, lease, tenure and kill time, containers run on, and restore
+\* reads the file back: what a crash loses is the call in flight, which is
+\* CallFail, and time, which is the agent not acting.  An outage that lets a
+\* deadline pass is a wedge (Urgent, below).
 
 \* The machine restarts: containers are gone, the boot id differs, the kept
 \* lease is not trusted and nothing is left to fence.
 Reboot(a) ==
-    /\ AllowReboot /\ ~healed /\ ~wedged[a]
-    /\ up' = [up EXCEPT ![a] = TRUE]
+    /\ AllowReboot /\ ~healed /\ ~wedged[a] /\ a \in Faulty
+    /\ phase[a] # "idle" \/ callKind[a] # "none"
     /\ phase' = [phase EXCEPT ![a] = "idle"]
     /\ myLease' = [myLease EXCEPT ![a] = 0]
     /\ tenureOk' = [tenureOk EXCEPT ![a] = FALSE]
     /\ age' = [age EXCEPT ![a] = 0]
+    /\ lost' = [lost EXCEPT ![a] = 0]
     /\ killAge' = [killAge EXCEPT ![a] = 0]
     /\ cont' = [cont EXCEPT ![a] = [s \in Slots |-> "none"]]
     /\ zomb' = [zomb EXCEPT ![a] = 0]
-    /\ IF callKind[a] # "none" THEN Abandon(a) ELSE UNCHANGED <<callKind, stale>>
-    /\ lost' = [lost EXCEPT ![a] = 0]
-    /\ UNCHANGED <<wedged, callLost, callSt, callL, callAge, pendOk, storeVars,
-                   healed, jumped, ovl, bad>>
+    /\ IF callKind[a] # "none" THEN Abandon(a)
+       ELSE UNCHANGED <<callKind, callSt, callL, callAge, callLost, pendOk, stale>>
+    /\ UNCHANGED <<wedged, storeVars, healed, jumped, ovl, bad>>
 
 Wedge(a) ==
-    /\ AllowWedge /\ ~healed /\ ~wedged[a]
+    /\ AllowWedge /\ ~healed /\ ~wedged[a] /\ a \in Faulty
     /\ wedged' = [wedged EXCEPT ![a] = TRUE]
-    /\ UNCHANGED <<phase, up, age, killAge, lost, callLost, myLease, tenureOk, callKind,
+    /\ UNCHANGED <<phase, age, killAge, lost, callLost, myLease, tenureOk, callKind,
                    callSt, callL, callAge, pendOk, stale, cont, storeVars, histVars>>
 
 (***************************************************************************)
@@ -491,7 +493,7 @@ Replace(s, n) ==
     /\ plan' = [k \in Scheds |->
                   IF plan[k] # None /\ plan[k].s = s
                   THEN [plan[k] EXCEPT !.freeOk = FALSE] ELSE plan[k]]
-    /\ UNCHANGED <<phase, up, wedged, age, killAge, lost, callLost, myLease, tenureOk,
+    /\ UNCHANGED <<phase, wedged, age, killAge, lost, callLost, myLease, tenureOk,
                    callKind, callSt, callL, callAge, pendOk, stale, left, keyL,
                    status, statusCur, lostAge, histVars>>
 
@@ -564,13 +566,18 @@ Urgent(a) ==
            /\ age[a] >= killAge[a] + KillLatency + StepMax)
        \/ (phase[a] = "held" /\ callKind[a] = "none"               \* renew
            /\ age[a] >= RenewAfter + StepMax)
-       \/ (healed /\ callKind[a] # "none" /\ callAge[a] >= HealedDelay)
+       \/ ((healed \/ a \notin Faulty) /\ callKind[a] # "none"       \* reply
+           /\ callAge[a] >= HealedDelay)
 
 \* skip: the one agent, if any, whose clock loses this tick.
+NodeCtlDue(n) == \/ (keyL[n] # 0 /\ ~(status[n] = "ready" /\ statusCur[n]))
+                 \/ (keyL[n] = 0 /\ status[n] = "ready")
+
 Tick(skip) ==
     /\ \A a \in Agents : ~Urgent(a)
+    /\ NodeCtlPrompt => \A n \in Agents : ~NodeCtlDue(n)
     /\ skip # None =>
-          /\ ~wedged[skip]
+          /\ ~wedged[skip] /\ skip \in Faulty
           /\ \/ (phase[skip] # "idle" /\ lost[skip] < SkewActual
                  /\ (callKind[skip] # "none" => callLost[skip] < SkewActual))
              \/ (phase[skip] = "idle" /\ callKind[skip] # "none"
@@ -598,13 +605,12 @@ Tick(skip) ==
     /\ zomb' = [a \in Agents |->
                   IF zomb[a] > 0 /\ HasCont(a) THEN Min(zomb[a] + 1, ZombCap)
                   ELSE zomb[a]]
-    /\ UNCHANGED <<phase, up, wedged, killAge, myLease, tenureOk, callKind, callSt,
+    /\ UNCHANGED <<phase, wedged, killAge, myLease, tenureOk, callKind, callSt,
                    callL, pendOk, stale, cont, keyL, status, statusCur, asg, obs,
                    plan, healed, jumped, bad>>
 
 AgentStep(a) ==
     \/ Register(a) \/ Renew(a) \/ Ack(a) \/ Nack(a) \/ TimerFence(a) \/ Fenced(a)
-    \/ Restart(a)
     \/ \E s \in Slots : Start(a, s) \/ StopStray(a, s) \/ Report(a, s) \/ ContExit(a, s)
 NetStep(a) == Serve(a) \/ ServeStale(a) \/ DropStale(a)
 ServerStep ==
@@ -613,7 +619,7 @@ ServerStep ==
     \/ \E k \in Scheds, s \in Slots, n \in Agents : Plan(k, s, n)
     \/ \E k \in Scheds : Commit(k)
 Fault ==
-    \/ \E a \in Agents : CallFail(a) \/ Crash(a) \/ Reboot(a) \/ Wedge(a)
+    \/ \E a \in Agents : CallFail(a) \/ Reboot(a) \/ Wedge(a)
     \/ \E s \in Slots : Decide(s)
     \/ StoreSetback
     \/ Heal
@@ -644,7 +650,7 @@ LiveSpec == Spec /\ Fairness
 (***************************************************************************)
 TypeOK ==
     /\ phase \in [Agents -> {"idle", "held", "fencing"}]
-    /\ up \in [Agents -> BOOLEAN] /\ wedged \in [Agents -> BOOLEAN]
+    /\ wedged \in [Agents -> BOOLEAN]
     /\ age \in [Agents -> 0..AgeCap] /\ callAge \in [Agents -> 0..AgeCap]
     /\ lost \in [Agents -> 0..SkewActual] /\ callLost \in [Agents -> 0..SkewActual]
     /\ killAge \in [Agents -> 0..(AgeCap + StopTime)]
@@ -706,5 +712,8 @@ Working == \A s \in Slots : \E a \in Agents :
 FencingSettles == (<>healed) => <>[]Stable
 WorkComesBack == (<>healed) => <>[]Working
 
+\* For configs in which every agent is in Faulty, or none is.
 Symm == Permutations(Agents) \cup Permutations(Slots) \cup Permutations(Scheds)
+\* For the others.
+SymmNoAgents == Permutations(Slots) \cup Permutations(Scheds)
 =============================================================================
