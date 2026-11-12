@@ -419,9 +419,11 @@ Report(a, s) ==
             /\ UNCHANGED <<phase, killAge, zomb>>
        ELSE /\ Told(a)
             /\ IF FenceOnConflict
-               THEN FenceFrom(a, age[a])
-               ELSE UNCHANGED <<phase, killAge>>
-            /\ UNCHANGED <<obs, cont, bad>>
+               THEN FenceFrom(a, age[a]) /\ UNCHANGED cont
+               ELSE \* tooth: the agent carries on as if the write had landed
+                    /\ cont' = [cont EXCEPT ![a][s] = "rep"]
+                    /\ UNCHANGED <<phase, killAge>>
+            /\ UNCHANGED <<obs, bad>>
     /\ UNCHANGED <<wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
                    callL, callAge, pendOk, stale, left, keyL, status, statusCur,
                    lostAge, asg, plan, healed, jumped, ovl>>
@@ -559,6 +561,13 @@ Heal ==
 (* something it does by a deadline still to do; this is what "the agent    *)
 (* process is alive and scheduled" (authority.md section 3) means here.    *)
 (***************************************************************************)
+\* The pass starts what is assigned and reports it in the same step
+\* (agent.zig, Pass: start puts the observed record, flush commits it).
+PassDue(a) ==
+    /\ phase[a] = "held" /\ callKind[a] = "none" /\ age[a] < FenceAt + StepMax
+    /\ \E s \in Slots : \/ (<<s, a>> \in asg /\ cont[a][s] = "none")
+                        \/ cont[a][s] = "run"
+
 Urgent(a) ==
     /\ ~wedged[a]
     /\ \/ (phase[a] = "held" /\ age[a] >= FenceAt + StepMax)      \* fence
@@ -566,6 +575,7 @@ Urgent(a) ==
            /\ age[a] >= killAge[a] + KillLatency + StepMax)
        \/ (phase[a] = "held" /\ callKind[a] = "none"               \* renew
            /\ age[a] >= RenewAfter + StepMax)
+       \/ PassDue(a)                                              \* the pass
        \/ ((healed \/ a \notin Faulty) /\ callKind[a] # "none"       \* reply
            /\ callAge[a] >= HealedDelay)
 
