@@ -112,9 +112,10 @@ VARIABLES
     pendOk,     \* the revision the served PUT made is still the current one
     stale,      \* a request the agent no longer waits for, still on its
                 \* way to the store: [kind, l]
-    cont,       \* [Agents -> [Slots -> {"none","run","rep","old"}]]: the
-                \* container of a slot's replica: none; running, not reported;
-                \* running, reported; running, its replica since replaced
+    cont,       \* [Agents -> [Slots -> {"none","run","rep","old","oldrun"}]]:
+                \* the container of a slot's replica: none; running, not
+                \* reported; running, reported; running, its replica since
+                \* replaced; the same, the report of its start still to make
     stop,       \* [Agents -> [Slots -> 0..StopCap]]: 0, or 1 + the agent-clock
                 \* ticks since the pass sent TERM to the slot's container
     \* --- store ---
@@ -147,7 +148,8 @@ NodeReady(n) == keyL[n] # 0 /\ status[n] = "ready" /\ statusCur[n]
 Admissible(n, s) == /\ obs[n][s] # None
                     /\ obs[n][s].ten /\ obs[n][s].asg /\ NodeReady(n)
 \* A container the pass stops: its replica is gone from the node.
-Stray(a, s) == cont[a][s] = "old" \/ (cont[a][s] # "none" /\ <<s, a>> \notin asg)
+Stray(a, s) == \/ cont[a][s] \in {"old", "oldrun"}
+               \/ (cont[a][s] # "none" /\ <<s, a>> \notin asg)
 
 Init ==
     /\ phase = [a \in Agents |-> "idle"]
@@ -472,20 +474,24 @@ StrayExit(a, s) ==
 
 \* An observed write: made when a container's state changed, never otherwise.
 \* It compares /nodes/<node> at the agent's tenure (Pass.new_batch, I2); a
-\* conflict begins the fence at once (Pass.commit).
+\* conflict begins the fence at once (Pass.commit).  The pass that starts a
+\* container makes the write in the same step, so it is made even if the
+\* replica was replaced in between ("oldrun").
+Reported(c) == IF c = "run" THEN "rep" ELSE "old"
 Report(a, s) ==
-    /\ InPass(a) /\ cont[a][s] = "run"
+    /\ InPass(a) /\ cont[a][s] \in {"run", "oldrun"}
     /\ IF tenureOk[a] \/ ~CompareTenure
-       THEN /\ obs' = [obs EXCEPT ![a][s] = [ten |-> tenureOk[a],
-                                             asg |-> <<s, a>> \in asg]]
-            /\ cont' = [cont EXCEPT ![a][s] = "rep"]
+       THEN /\ obs' = [obs EXCEPT ![a][s] =
+                         [ten |-> tenureOk[a],
+                          asg |-> cont[a][s] = "run" /\ <<s, a>> \in asg]]
+            /\ cont' = [cont EXCEPT ![a][s] = Reported(@)]
             /\ bad' = IF tenureOk[a] THEN bad ELSE bad \cup {"stale_observation"}
             /\ UNCHANGED <<phase, killAge, zomb>>
        ELSE /\ Told(a)
             /\ IF FenceOnConflict
                THEN FenceFrom(a, age[a]) /\ UNCHANGED cont
                ELSE \* tooth: the agent carries on as if the write had landed
-                    /\ cont' = [cont EXCEPT ![a][s] = "rep"]
+                    /\ cont' = [cont EXCEPT ![a][s] = Reported(@)]
                     /\ UNCHANGED <<phase, killAge>>
             /\ UNCHANGED <<obs, bad>>
     /\ UNCHANGED <<wedged, age, lost, callLost, myLease, tenureOk, callKind, callSt,
@@ -573,7 +579,9 @@ Replace(s, n) ==
     /\ obs' = [a \in Agents |->
                  [obs[a] EXCEPT ![s] = IF @ = None THEN None ELSE [@ EXCEPT !.asg = FALSE]]]
     /\ cont' = [a \in Agents |->
-                  [cont[a] EXCEPT ![s] = IF @ = "none" THEN "none" ELSE "old"]]
+                  [cont[a] EXCEPT ![s] = IF @ = "none" THEN "none"
+                                         ELSE IF @ \in {"run", "oldrun"} THEN "oldrun"
+                                         ELSE "old"]]
     /\ plan' = [k \in Scheds |->
                   IF plan[k] # None /\ plan[k].s = s
                   THEN [plan[k] EXCEPT !.freeOk = FALSE] ELSE plan[k]]
@@ -648,7 +656,7 @@ Heal ==
 PassDue(a) ==
     /\ phase[a] = "held" /\ callKind[a] = "none" /\ age[a] < FenceAt + StepMax
     /\ \E s \in Slots : \/ (<<s, a>> \in asg /\ cont[a][s] = "none")
-                        \/ cont[a][s] = "run"
+                        \/ cont[a][s] \in {"run", "oldrun"}
                         \/ (Stray(a, s) /\ stop[a][s] = 0)
                         \/ (ForgetDue(a, s)
                             /\ (tenureOk[a] \/ FenceOnConflict \/ ~CompareTenure))
@@ -764,7 +772,7 @@ TypeOK ==
     /\ myLease \in [Agents -> 0..NL] /\ keyL \in [Agents -> 0..NL]
     /\ callKind \in [Agents -> {"none", "put", "ka"}]
     /\ callSt \in [Agents -> {"req", "ok", "nf"}]
-    /\ cont \in [Agents -> [Slots -> {"none", "run", "rep", "old"}]]
+    /\ cont \in [Agents -> [Slots -> {"none", "run", "rep", "old", "oldrun"}]]
     /\ stop \in [Agents -> [Slots -> 0..StopCap]]
     /\ \A a \in Agents, s \in Slots : stop[a][s] > 0 => cont[a][s] # "none"
     /\ left \in [Agents -> [Leases -> 0..TTL]]
@@ -802,9 +810,13 @@ I1b_NoOverlap ==
 \* I1b, as section 4 states it: not for longer than lost_grace_ms plus kill
 \* latency.
 I1b_Window == \A s \in Slots : ovl[s] <= LostGrace + KillLatency
-\* Not a property: a probe.  Its counterexample is a run in which an overlap
-\* lasts the whole of stop_grace_ms plus the kill latency.
-OverlapShorterThanStopGrace == \A s \in Slots : ovl[s] < StopGrace + KillLatency
+\* Not a property: a probe.  Its counterexample is a run in which the pass
+\* stops a container whose replica was replaced, and the container and its
+\* replacement both run for the whole of stop_grace_ms plus the kill latency.
+StrayOverlapShorterThanStopGrace ==
+    \A a \in Agents, s \in Slots :
+        ~(/\ phase[a] = "held" /\ stop[a][s] > StopGrace + KillLatency
+          /\ ovl[s] >= StopGrace + KillLatency)
 
 \* I2. No transaction commits whose tenure or placement epoch was superseded.
 I2_NoStaleCommit ==
