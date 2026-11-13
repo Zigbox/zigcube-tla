@@ -16,7 +16,7 @@ config `TTL = 6`, the fence is at agent time 3 (`FenceAt = TTL − Margin`), and
 | 2 | The lost grace is counted from the first `mark_lost`, so a second expiry can have none | code differs from authority.md | `finding-spent-grace` | `I1b_NoOverlap` violated (same tick); `I1b_Window` holds |
 | 3 | Lease deadlines are absolute store-clock values | code differs from authority.md | `finding-store-setback` | `I1b_Window` violated |
 | 4 | The inequality has no term for a late agent step | gap in authority.md, zero slack in the constants | `finding-step-lag` | `I1b_NoOverlap` violated; holds when the lag is under `lost_grace` |
-| 5 | Retention deletes a job without looking at its run's assignment; if the scheduler has not released it and the name is used again, the agent claims under the old assignment and starts the run on every pass | **protocol bug** (J2; a run that never ends), needs an assignment that outlives its job by an hour | `finding-job-reuse-assigned` | `J2_StartedOnce` violated |
+| 5 | Retention deletes a job without looking at its run's assignment; if the scheduler has not released it and the name is used again, the agent claims under the old assignment and starts the run on every pass, or the old run's ending is reported again and ends the new job | **protocol bug** (J2: a run that never ends; J11: a job ended by another job's report), needs an assignment that outlives its job by an hour | `finding-job-reuse-assigned`, `finding-job-reuse-report` | `J2_StartedOnce` violated; `J11_ExitedWasStarted` violated |
 | 6 | A state directory lost under a running agent: no fence, no start records, the job containers run on | gap the simulator names and does not cover | `finding-job-dirloss` | `J8_Deadline` violated |
 
 With those six faults excluded, every invariant holds in every passing
@@ -483,13 +483,54 @@ run while the run is assigned), `J2_StartedOnce`, 16 states. With
 (The cancel is only TLC's shortest way to an ended job with an assignment;
 any ending does.)
 
+**Second form: the old run's ending ends the new job.** If the old run was
+started and ended on the node, the agent still has its record and its ended
+container when retention deletes the job together with the node's
+observation. On its next pass the agent finds no observation of the ending
+(`seen_of`, `src/agent_jobs.zig:329`) and reports it again (`stopped`, 664;
+`report`, 1083). The report compares the tenure and the assignment at its
+epoch, both unchanged, and not the run, so the store accepts it whether or
+not a run of that id exists. Once the name is submitted again, the job
+controller reads a stopped observation from the node's current tenure under
+the epoch the run id is assigned at: `admissible`
+(`src/job_controller.zig:776`) compares the node key's revision, the
+assignment's revision and the node's readiness, and nothing of the run. The
+new job goes from `pending` to `exited` (or `failed`) with the old run's
+exit code and was never started (J11). If the agent's pass comes after the
+submit instead, it is the first form.
+
+TLC: `finding-job-reuse-report`, `J11_ExitedWasStarted`, 16 states. The two
+configs differ only in which of the two invariants they check, so that each
+reports one result at the same depth.
+
+**Trace** (`finding-job-reuse-report`):
+
+```
+ 2-5              a1 registers on L1, held, marked ready
+ 6 Submit           incarnation 1: job, run, status pending
+ 7-8 SPlan, SCommit /assigned/a1/<id> written, epoch 1
+ 9 JClaim a1        claims and starts
+10 JExit a1         the container exits
+11 JReport a1       observation: stopped, exit, tenure of a1, epoch 1
+12 CEndReport       status exited
+13 Retention        job, run, status and the observation deleted.
+                    The assignment stays.
+14 JReport a1       record and ended container are there, the observation
+                    is not: reports stopped again under epoch 1.  Accepted.
+15 Submit           incarnation 2: the same run id, status pending
+16 CEndReport       the observation is admissible: status exited.
+                    No start in incarnation 2: J11_ExitedWasStarted
+```
+
 **Suggested repair:** make the deletion and the assignment exclusive.
 Either `drop_job` reads the run's assignment and leaves the job for a later
 pass while one exists (compare its absence in the transaction), or the job
 controller's create refuses or waits while `/assigned/*/<name>-job` exists.
 On the agent, a claim whose subject epoch is older than the run's
 `create_revision` can be refused locally: that assignment is not of this
-run.
+run. For the second form, `admissible` can refuse an observation whose
+assignment epoch is older than the run's `create_revision`, which is the
+agent's own `is_stale_epoch` test on the controller's side.
 
 ## 6. A lost state directory leaves job containers that nothing stops
 
@@ -588,5 +629,6 @@ state directory lost under a running agent (findings 5 and 6), J1 to J3 and
 J5 to J11 hold on one node under call loss, timeouts, late replies, expiry,
 reboots with and without the state directory, cancels at any moment, slow
 input fetches and, in `jobs-reuse`, a second incarnation of the name. J4 is
-not expressible. The job configs have one node, one job and no clock error;
-what the fencing configs show about two nodes is not repeated for jobs.
+not expressible. The job configs have one job and no clock error. Two nodes
+are checked with call loss and expiry only (`jobs-two-nodes`); reboots,
+cancels and slow fetches are checked on one node.
