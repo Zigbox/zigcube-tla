@@ -11,6 +11,10 @@ It was written from `docs/authority.md`, the decisions of 2026-10-27,
 `src/store_postgres.zig`) at Zigcube commit `f7736a7`. It does not use the
 sim-c1 simulator and shares nothing with it.
 
+`Jobs.tla` extends it to Zigcube's jobs (the checks J1 to J11 of
+`docs/core.md`), from the job controller, the scheduler, retention and the
+agent's job path at the same commit: see [Jobs](#jobs).
+
 **What TLC found is in [FINDINGS.md](FINDINGS.md).** Read that first.
 
 ## How to run
@@ -23,7 +27,8 @@ sim-c1 simulator and shares nothing with it.
 
 Needs Java 11 or later and `curl`. `run.sh` downloads `tla2tools.jar` v1.7.4
 into `.tools/` (not committed), checks its SHA-256, runs TLC on each config
-and compares the result with the config's `\* EXPECT` line. It exits non-zero
+(against `Fencing.tla`, or the module a `\* MODULE` line names) and compares
+the result with the config's `\* EXPECT` line. It exits non-zero
 when any config gives another result: a passing config that fails, or a
 "teeth" config in which TLC no longer finds the violation. TLC's full output,
 with the counterexample traces, is left in `out/`.
@@ -230,8 +235,10 @@ of `stop_grace_ms` plus the kill latency.
 
 ## Files
 
-- `Fencing.tla`: the model.
+- `Fencing.tla`: the lease, fencing and authority model.
+- `Jobs.tla`: jobs, on top of it.
 - `configs/*.cfg`: one TLC config each; line 1 says what it is, line 2 what
-  TLC must report, `\* SLOW` on line 3 keeps it out of the default run.
+  TLC must report, `\* SLOW` on line 3 keeps it out of the default run,
+  `\* MODULE Jobs` on line 3 marks a config of `Jobs.tla`.
 - `run.sh`: the runner. `.github/workflows/tlc.yml`: CI.
 - `FINDINGS.md`: what TLC found, with traces and the places in Zigcube.

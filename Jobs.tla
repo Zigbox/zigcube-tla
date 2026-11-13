@@ -421,7 +421,8 @@ Submit ==
     /\ job' = "live" /\ run' = "live"
     /\ jst' = [NoStatus EXCEPT !.st = "pending"]
     /\ sub' = 0 /\ starts' = 0 /\ firstEnd' = "none"
-    /\ UNCHANGED <<jasg, jo, jplan, jbad>> /\ ServerOnly
+    /\ stopAge' = [a \in Agents |-> 0]
+    /\ UNCHANGED <<jasg, jo, jplan, jbad>> /\ UNCHANGED <<vars, jAgent, after>>
 Cancel ==
     /\ AllowCancel /\ job = "live" /\ Open
     /\ job' = "cancel"

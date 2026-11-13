@@ -17,7 +17,7 @@ config `TTL = 6`, the fence is at agent time 3 (`FenceAt = TTL − Margin`), and
 | 3 | Lease deadlines are absolute store-clock values | code differs from authority.md | `finding-store-setback` | `I1b_Window` violated |
 | 4 | The inequality has no term for a late agent step | gap in authority.md, zero slack in the constants | `finding-step-lag` | `I1b_NoOverlap` violated; holds when the lag is under `lost_grace` |
 | 5 | Retention deletes a job without looking at its run's assignment; if the scheduler has not released it and the name is used again, the agent claims under the old assignment and starts the run on every pass | **protocol bug** (J2; a run that never ends), needs an assignment that outlives its job by an hour | `finding-job-reuse-assigned` | `J2_StartedOnce` violated |
-| 6 | A state directory lost under a running agent: no fence, no start records, the job containers run on | gap the simulator names and does not cover | `finding-job-dirloss` | `J8_Deadline` violated (then J1) |
+| 6 | A state directory lost under a running agent: no fence, no start records, the job containers run on | gap the simulator names and does not cover | `finding-job-dirloss` | `J8_Deadline` violated |
 
 With those six faults excluded, every invariant holds in every passing
 config, and TLC caught every safeguard that was taken away (README, teeth
@@ -511,8 +511,12 @@ If the store cannot be reached, there is no such pass: the containers run
 with no fence and no deadline while the node's old lease expires, the node
 is declared lost and the job controller ends the job.
 
-TLC: `finding-job-dirloss` (`AllowDirLoss = TRUE`), `J8_Deadline`, 15 states;
-the same run goes on to violate `J1_NotAliveAfterEnding`.
+TLC: `finding-job-dirloss` (`AllowDirLoss = TRUE`), `J8_Deadline`, 15 states.
+J1 follows once the node is declared lost and the job ended. The config does
+not check J1, because the model ends a job at once when its claim's node key
+is written again (README, "the tenure-ended wait"), which is right only while
+an agent life cannot outlive its tenure unfenced, and this fault is exactly
+that.
 
 **Trace** (`finding-job-dirloss`):
 
@@ -560,6 +564,16 @@ that this is not a first start).
   `src/agent_fence_test.zig`: with a fence window of `ttl / 3` the agent
   fences on every lease and never settles. The rule of 2026-11-06
   (`src/fencing.zig:78-83`) passes in the same constants (`live-short-window`).
+- **J7's "the run has no stop".** core.md's J7 says each start has a
+  committed claim "and the run has no stop". The agent judges that on the run
+  as its pass read it: `claim` returns if the run has a stop, then writes the
+  claim (which compares the run's revision), fetches the input and starts
+  (`src/agent_jobs.zig:724`, `begin`); a later pass that finds
+  `claimed_unstarted` tests the run it read at its own start. A stop that
+  commits after the claim and before the start is not seen by that start. It
+  is seen on the next pass and honoured within the grace (J6 holds), so what
+  the code keeps is "no stop when the claim committed", up to one pass. The
+  model has it the same way.
 
 ## What TLC did not find
 
@@ -568,3 +582,11 @@ I7, the 2026-11-08 rule, `TimedOutPutIsDead` and both liveness properties
 hold, under call loss, delay, late replies, timeouts, stale keepalives,
 crashes, reboots, two schedulers, and skew up to the bound. That is a statement about the model at these sizes, with
 the cuts the README lists.
+
+For jobs: with the scheduler releasing ended runs before retention and no
+state directory lost under a running agent (findings 5 and 6), J1 to J3 and
+J5 to J11 hold on one node under call loss, timeouts, late replies, expiry,
+reboots with and without the state directory, cancels at any moment, slow
+input fetches and, in `jobs-reuse`, a second incarnation of the name. J4 is
+not expressible. The job configs have one node, one job and no clock error;
+what the fencing configs show about two nodes is not repeated for jobs.
