@@ -55,6 +55,7 @@ CONSTANTS
     ReportCurrentEpoch, \* a report names the run's current assignment
     EndLocally,         \* a run with no assignment here is not reported
     StopUnclaimed,      \* the controller stops a run not claimed by start_by
+    FenceStopsJobs,     \* the fence stops job containers with the others
     CheckStaleEpoch     \* leftovers of an earlier job of the name are not
                         \* taken for the new run's
 
@@ -63,11 +64,17 @@ Stops == {"cancel", "unreach", "nostart"}
 
 RanCap == Deadline + JobGrace + KillLatency + StopTime + 3
 JtCap == JobGrace + KillLatency + 1
-\* J1: overlap_ms_max less the simulator's granularity (sim_cluster.zig).
-J1Bound == LostGrace + KillLatency + StopTime
-\* J6: stop_bound_ms (sim_jobs.zig): the agent sees the stop at once and
-\* stops within the grace, or it cannot reach the server and fences.
-J6Bound == Max(JobGrace + KillLatency, FenceAt + StopTime + KillLatency)
+\* J1: the simulator allows overlap_ms_max (lost grace, kill latency, fence
+\* stop, a tick, a check interval).  Here a job that is running ends only on
+\* a report from its node or once its claim's tenure has ended and the lost
+\* grace has passed, and the fence is over by then: with no clock error and
+\* no late step the bound is no tick at all, and TLC holds it to that.
+J1Bound == 0
+\* J6: stop_bound_ms.  The agent is in a pass, sees the stop at once and
+\* stops within the grace; or it is in a call, which began no earlier than
+\* RenewAfter, and its fence stops the container.
+J6Bound == Max(JobGrace + KillLatency,
+               FenceAt - RenewAfter + StopTime + KillLatency)
 \* J8: deadline_bound_ms with no clock error and no wedge.
 J8Bound == Deadline + JobGrace + KillLatency
 
@@ -336,7 +343,7 @@ JExit(a) ==
 \* The fence stops job containers with the others; note_fence records the
 \* cause first.
 JFenceKill(a) ==
-    /\ ~wedged[a] /\ phase[a] = "fencing" /\ Live(a)
+    /\ FenceStopsJobs /\ ~wedged[a] /\ phase[a] = "fencing" /\ Live(a)
     /\ SetCont(a, [jc[a] EXCEPT !.st = "done"])
     /\ jrec' = [jrec EXCEPT ![a] =
                   IF @ # None /\ @.cause = "none" THEN [@ EXCEPT !.cause = "fence"] ELSE @]
@@ -359,7 +366,7 @@ JobUrgent(a) ==
     /\ ~wedged[a]
     /\ \/ (InPass(a) /\ JobPassDue(a))
        \/ (jc[a].st = "stopping" /\ jt[a] >= JobGrace + KillLatency)
-       \/ (phase[a] = "fencing" /\ Live(a)
+       \/ (FenceStopsJobs /\ phase[a] = "fencing" /\ Live(a)
            /\ age[a] >= killAge[a] + KillLatency + StepMax)
        \/ (DeadlineOffline /\ ~InPass(a) /\ DeadlineG(a))
 
@@ -438,7 +445,8 @@ End(s) == /\ jst' = [jst EXCEPT !.st = s]
 \* lost_grace_ms from when it first saw the key change; here it does not.)
 TenureEnded(n, tenOk) ==
     /\ ~tenOk
-    /\ keyL[n] = 0 => (status[n] = "lost" /\ lostAge[n] >= LostGrace)
+    /\ keyL[n] = 0 => /\ status[n] = "lost"
+                      /\ UseLostGrace => lostAge[n] >= LostGrace
 
 \* end: an admissible report of `stopped`.
 CEndReport(n) ==
@@ -483,7 +491,7 @@ CStopUnclaimed ==
     /\ jst.st = "pending" /\ NoClaim /\ run = "live"
     /\ \/ StopUnclaimed /\ sub > StartBy /\ run' = "nostart"
        \/ /\ \E n \in Agents : /\ jasg[n] # 0 /\ status[n] = "lost"
-                               /\ lostAge[n] >= LostGrace
+                               /\ UseLostGrace => lostAge[n] >= LostGrace
           /\ run' = "unreach"
     /\ UNCHANGED <<jinc, job, jst, jasg, jo, jplan, jHist>> /\ UNCHANGED <<vars, jAgent>>
 
@@ -563,7 +571,7 @@ FencingStep ==
     \/ \E a \in Agents :
           \/ Register(a) \/ Renew(a) \/ Ack(a) \/ Nack(a) \/ TimerFence(a)
           \/ CallTimeout(a) \/ NetStep(a) \/ CallLost(a) \/ Wedge(a)
-          \/ (Fenced(a) /\ ~Live(a))
+          \/ (Fenced(a) /\ (FenceStopsJobs => ~Live(a)))
           \/ \E s \in Slots : \/ Start(a, s) \/ Report(a, s) \/ Forget(a, s)
                               \/ StopTerm(a, s) \/ StrayExit(a, s) \/ ContExit(a, s)
     \/ ServerStep
