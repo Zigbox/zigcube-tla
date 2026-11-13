@@ -11,19 +11,24 @@ It was written from `docs/authority.md`, the decisions of 2026-10-27,
 `src/store_postgres.zig`) at Zigcube commit `f7736a7`. It does not use the
 sim-c1 simulator and shares nothing with it.
 
+`Jobs.tla` extends it to Zigcube's jobs (the checks J1 to J11 of
+`docs/core.md`), from the job controller, the scheduler, retention and the
+agent's job path at the same commit: see [Jobs](#jobs).
+
 **What TLC found is in [FINDINGS.md](FINDINGS.md).** Read that first.
 
 ## How to run
 
 ```sh
-./run.sh                  # every config but the slow one; about 16 minutes on 4 cores
+./run.sh                  # every config but the slow one; about 30 minutes on 4 cores (16 fencing, 13 jobs)
 ./run.sh --slow           # the slow one too; about 15 minutes more
 ./run.sh base teeth-skew  # only these
 ```
 
 Needs Java 11 or later and `curl`. `run.sh` downloads `tla2tools.jar` v1.7.4
 into `.tools/` (not committed), checks its SHA-256, runs TLC on each config
-and compares the result with the config's `\* EXPECT` line. It exits non-zero
+(against `Fencing.tla`, or the module a `\* MODULE` line names) and compares
+the result with the config's `\* EXPECT` line. It exits non-zero
 when any config gives another result: a passing config that fails, or a
 "teeth" config in which TLC no longer finds the violation. TLC's full output,
 with the counterexample traces, is left in `out/`.
@@ -228,10 +233,159 @@ of `stop_grace_ms` plus the kill latency.
 | `teeth-no-absent-compare` | the "assignment absent" compare, with two schedulers | `I1a_OneAssignment` violated |
 | `teeth-inadmissible` | the admissibility check | `I3_NoInadmissibleCause` violated |
 
+## Jobs
+
+`Jobs.tla` extends `Fencing.tla` with Zigcube's jobs: the checks J1 to J11 of
+`docs/core.md`, and section 7 of authority.md. It was written from
+`src/job_controller.zig`, `src/scheduler.zig` (`place_run`, `release_run`),
+`src/job_retention.zig` and `src/agent_jobs.zig` at Zigcube commit `f7736a7`,
+and, like the rest, shares nothing with the simulator.
+
+Every step of `Fencing.tla` is a step of `Jobs.tla`, with the job state
+following it: a write of `/nodes/<node>` ends the tenure that observations
+and the job's status were written under, a fence stops the job's container, a
+reboot loses it. A job step of an agent is a step of its pass (`InPass`), its
+claim and its reports are observed writes that compare the tenure, and a
+refused one begins the fence.
+
+### What is modelled
+
+One job name, through `MaxInc` incarnations:
+
+- **Server.** Submit (the API's create and the controller's create of the run
+  and the status); cancel; placement as read then commit, the commit comparing
+  the node, its status, the job's status, the run and the absence of an
+  assignment; the controller's transactions (`mark_running` on an admissible
+  claim, the ending on an admissible report, the fence report from the node
+  the status names, the stop for cancel, for a run not claimed by `start_by`
+  and for a lost node, the ending of a run whose claim's tenure has ended
+  after the lost grace); `release_run`; retention's `drop_job`.
+- **Agent.** The pass of `Work.one`: the `claiming` record, the claim, the
+  `claimed` record and the start, as one pass or cut after the record or
+  after the claim (a crash, a lost reply, an input that is not there yet);
+  `claimed_unstarted` with its test that the claim is this tenure's and this
+  epoch's; `not_started`, `gone`, `unknown`, `stopped`; the stop for the run's
+  stop, the deadline (also with no server, from the start record) and a run
+  that is no longer served; the report under the run's current assignment and
+  the local ending of a run with none; leftovers of an earlier job of the
+  name (`is_stale_epoch`, `stop_stale`).
+- **Faults.** All of `Fencing.tla`'s (call loss, timeouts, late replies,
+  expiry, reboot), a reboot that also loses the state directory
+  (`AllowWipe`), and in one config the directory lost with the machine up
+  (`AllowDirLoss`).
+
+An assignment's epoch is the number of the incarnation it was written in.
+The code compares epochs for equality and against the run's
+`create_revision`; a node is assigned a run at most once per incarnation, so
+both compares are exact in this encoding.
+
+### What is abstracted away
+
+- **One job.** Jobs do not interact except through the scheduler's capacity,
+  which is one boolean here (`Placeable`).
+- **No `placed` status and no `running` observation.** Neither decides
+  anything in the controller.
+- **Retention's hour.** `drop_job` runs an hour or more after the ending. No
+  model of ticks spans that; here it may run once every call is answered or
+  given up and every fence and stop is over (`Quiet`). Whether the scheduler
+  has released the assignment by then is a switch (`ReleasePrompt`), because
+  nothing in the code makes it so: finding 5.
+- **Clock error.** Job configs run with `SkewActual = 0`. The base model
+  lets the agent clock lose a tick per lease period, which is far coarser
+  than a rate and swamps the job timers (two ticks of grace). The fencing
+  configs cover skew for the fence itself.
+- **The tenure-ended wait.** The controller waits `lost_grace_ms` after it
+  sees that a claim's node key was written again; the model does not wait in
+  that case (the old agent life has fenced or rebooted before the key can be
+  written again). For an expired key it waits the lost grace.
+- **Stops are immediate where the code uses no grace** (`stop_stale`).
+- **The input fetch** is one switch (`FetchSlow`: the claim and the start may
+  be passes apart); its failure kinds are not modelled.
+- **J4** (a watch client sees every ending once) is about the watch stream,
+  which the model does not have.
+- **J7's "the run has no stop"** is judged as the code judges it, on the run
+  as the pass read it. See FINDINGS.md, smaller differences.
+
+### Properties
+
+| Property in `Jobs.tla` | core.md | Says |
+|---|---|---|
+| `J1_NotAliveAfterEnding` | J1 | A job container is not alive after its job reached a terminal status. The simulator allows `overlap_ms_max`; with no clock error and no late step the model's bound is zero ticks, and it is held to that. |
+| `J2_StartedOnce` | J2 | A run is started at most once in an incarnation, on any node and in any agent life. |
+| `J3_EndingStands` | J3 | A terminal status never changes. (That the status goes only with its job is in `JTypeOK`.) |
+| | J4 | Not expressible: no watch stream in the model. |
+| `J5_AssignedOnce` | J5 | No placement commits after the run's stop, and a run has one assignment. |
+| `J6_StopHonoured` | J6 | A container runs no longer than the stop bound after its run's stop committed: the grace and the kill latency, or the rest of the fence if the agent is in a call. |
+| `J7_StartHasClaim` | J7 | Every start stands on a committed claim of this run under the assignment's epoch. |
+| `J8_Deadline` | J8 | A container runs no longer than the deadline, the grace and the kill latency. |
+| `J8_RunsEnd` (liveness) | J8, second clause | Once faults stop, no run stays open. |
+| `J9_ReportUnderAssignment` | J9 | A report is stored only under the run's stored assignment. |
+| `J10_NoRefusedLoop` | J10 | No report is made that the store must refuse for want of an assignment. Reads are atomic in the model, so the correct agent makes none; the simulator's form is a bound on the count. |
+| `J11_ExitedWasStarted` | J11 | A status of `exited` is of a run started in its own incarnation. |
+| `JTypeOK` | | The model itself; job, run and status exist together. |
+
+`J8_RunsEnd` is checked under `JFairness`: weak fairness of time, of each
+agent's steps (lease and job), of delivery, and of each controller and
+scheduler action. None of faults, of cancel, of retention or of release.
+
+The job configs also check `TypeOK`, `LeaseSlotsSuffice`,
+`TimedOutPutIsDead`, `I2_NoStaleCommit` and `DeadBeforeExpiry` of the base
+model.
+
+### Results
+
+| Config | Checks | Result | Generated | Distinct | Depth | Time (4 cores) |
+|---|---|---|---|---|---|---|
+| `jobs-base` | all invariants | pass | 12,436,137 | 2,534,830 | 54 | 75 s |
+| `jobs-reuse` | all invariants, two incarnations | pass | 29,404,090 | 5,909,465 | 60 | 163 s |
+| `jobs-live` | `J8_RunsEnd`; call loss, no reboot | pass | 1,333,275 | 412,372 | 54 | 64 s |
+| `jobs-live-reboot` | `J8_RunsEnd`; reboot, no call loss | pass | 4,006,025 | 1,011,586 | 56 | 179 s |
+| `jobs-live-unplaceable` | `J8_RunsEnd`; a run that fits nowhere | pass | 221,679 | 54,236 | 29 | 9 s |
+| `jobs-two-nodes` | all invariants; two nodes, one faulty (call loss, expiry; no reboot, cancel or slow fetch) | pass | 12,797,065 | 3,585,118 | 59 | 129 s |
+
+The teeth and finding configs each take between one second and one minute.
+
+`jobs-base` is one node with every fault but a wedge; `jobs-two-nodes` has a second, correct node and
+fewer faults on the first (two nodes with reboots and cancels do not fit a
+CI run);
+`jobs-reuse` follows the name through two incarnations; the `jobs-live*`
+configs check `J8_RunsEnd`, each with part of the faults, because liveness
+over the whole of `jobs-base` with a heal does not finish in half an hour.
+
+| Teeth config | What is taken away (simulator tooth) | TLC reports |
+|---|---|---|
+| `teeth-job-claim` | the start waits for the committed claim (`job_claim`) | `J7_StartHasClaim` violated |
+| `teeth-job-restart` | a container that ended is not started again (`job_restart`) | `J2_StartedOnce` violated |
+| `teeth-job-wipe` | a claim with no start record is reported lost (`job_wipe`) | `J2_StartedOnce` violated |
+| `teeth-job-double` | the run compare of a placement (`job_double`) | `J5_AssignedOnce` violated |
+| `teeth-job-rewrite` | a late report is dropped (`job_rewrite`) | `J3_EndingStands` violated |
+| `teeth-job-cancel` | the agent honours the run's stop (`job_cancel`) | `J6_StopHonoured` violated |
+| `teeth-job-deadline` | the deadline (`job_deadline`) | `J8_Deadline` violated |
+| `teeth-job-deadline-offline` | the deadline with no server (`deadline_offline`) | `J8_Deadline` violated |
+| `teeth-job-unclaimed` | the stop of a run nobody claimed by `start_by` (`job_unclaimed`) | `J8_RunsEnd` violated |
+| `teeth-job-stale` | the report names the current assignment (`job_stale`) | `J9_ReportUnderAssignment` violated |
+| `teeth-job-refused-loop` | a run with no assignment ends locally (`job_refused_loop`) | `J10_NoRefusedLoop` violated |
+| `teeth-job-reuse` | the stale-epoch test (`job_reuse`) | `J11_ExitedWasStarted` violated |
+| `teeth-job-no-fence` | the fence stops job containers | `J1_NotAliveAfterEnding` violated |
+
+The findings have a config each: `finding-job-reuse-assigned` (J2) and
+`finding-job-reuse-report` (J11) for finding 5, `finding-job-dirloss` (J8)
+for finding 6. Each is a spec with one switch off the code's actual
+behaviour (`ReleasePrompt = FALSE`, `AllowDirLoss = TRUE`), not a removed
+safeguard.
+
+The simulator's teeth with no counterpart: `job_gap` (J4), `deadline_late`
+(a deadline enforced some seconds late: the model's deadline is exact, and
+`teeth-job-deadline` removes it), `job_evicted` (a controller sweep that
+stops after 512 jobs: the model has one) and `job_ledger_small` (the
+simulator's own ledger).
+
 ## Files
 
-- `Fencing.tla`: the model.
+- `Fencing.tla`: the lease, fencing and authority model.
+- `Jobs.tla`: jobs, on top of it.
 - `configs/*.cfg`: one TLC config each; line 1 says what it is, line 2 what
-  TLC must report, `\* SLOW` on line 3 keeps it out of the default run.
+  TLC must report, `\* SLOW` on line 3 keeps it out of the default run,
+  `\* MODULE Jobs` on line 3 marks a config of `Jobs.tla`.
 - `run.sh`: the runner. `.github/workflows/tlc.yml`: CI.
 - `FINDINGS.md`: what TLC found, with traces and the places in Zigcube.

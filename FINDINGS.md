@@ -16,8 +16,10 @@ config `TTL = 6`, the fence is at agent time 3 (`FenceAt = TTL − Margin`), and
 | 2 | The lost grace is counted from the first `mark_lost`, so a second expiry can have none | code differs from authority.md | `finding-spent-grace` | `I1b_NoOverlap` violated (same tick); `I1b_Window` holds |
 | 3 | Lease deadlines are absolute store-clock values | code differs from authority.md | `finding-store-setback` | `I1b_Window` violated |
 | 4 | The inequality has no term for a late agent step | gap in authority.md, zero slack in the constants | `finding-step-lag` | `I1b_NoOverlap` violated; holds when the lag is under `lost_grace` |
+| 5 | Retention deletes a job without looking at its run's assignment; if the scheduler has not released it and the name is used again, the agent claims under the old assignment and starts the run on every pass, or the old run's ending is reported again and ends the new job | **protocol bug** (J2: a run that never ends; J11: a job ended by another job's report), needs an assignment that outlives its job by an hour | `finding-job-reuse-assigned`, `finding-job-reuse-report` | `J2_StartedOnce` violated; `J11_ExitedWasStarted` violated |
+| 6 | A state directory lost under a running agent: no fence, no start records, the job containers run on | gap the simulator names and does not cover | `finding-job-dirloss` | `J8_Deadline` violated |
 
-With those four faults excluded, every invariant holds in every passing
+With those six faults excluded, every invariant holds in every passing
 config, and TLC caught every safeguard that was taken away (README, teeth
 table).
 
@@ -402,6 +404,185 @@ of two ticks everything holds (`step-lag-within-grace`).
 `margin_needed_ms` (and to ZC-E0121), and have the KILL fire from a timer that
 does not wait for a reconcile step.
 
+## 5. Retention deletes a job whose run is still assigned
+
+Findings 5 and 6 are from the jobs model (`Jobs.tla`), written from zigcube
+`f7736a7`.
+
+`drop_job` (`src/job_retention.zig:308-321`) deletes `/jobs/<name>`, the
+input, `/job-runs/<name>-job`, `/job-status/<name>` and the node's
+observation in one transaction that compares the status's revision and
+nothing else. `/assigned/<node>/<name>-job` is neither read nor deleted. The
+scheduler is expected to have released it by then: `release_run`
+(`src/scheduler.zig:773`) releases the assignment of a run whose status is
+terminal, and retention waits at least an hour (`job_finished_age_ms_min`,
+`src/constants.zig:995`).
+
+Nothing makes that so. `release_run` returns without releasing when the
+node's allocation is unaccounted (`view.alloc_revision == 0`, line 793), when
+the subtraction fails (794), when the pass has no budget left (796), and of
+course when no scheduler runs. The first two are standing conditions, not
+delays. If the assignment is still there when retention deletes the job, and
+the name is then submitted again before a scheduler pass releases it ("its
+job is gone"), the run id `<name>-job` is the same and:
+
+- the scheduler does not place the new run (the id is assigned) and does not
+  release the old assignment any more (the status is `pending`, line 784);
+- the agent on that node sees a served run and an assignment and claims it
+  (`claim`, `src/agent_jobs.zig:724`) under the old assignment's epoch. Every
+  compare of the claim passes: the tenure, the run, the assignment at that
+  epoch. It starts the container;
+- the job controller finds the claim admissible and marks the job running;
+- on the agent's next pass its own start record, its own observation and its
+  own container carry an epoch older than the run's `create_revision`, which
+  is what `is_stale_epoch` (`src/agent_jobs.zig:348`) takes for leftovers of
+  an earlier job of the name. `stop_stale` (372) kills the container with no
+  grace, the record counts as absent, the observation as not seen, and the
+  agent claims and starts again. And again on every pass.
+
+One run id is started over and over within one incarnation (J2), each
+container killed after one pass, with a status of `running` throughout.
+The run's deadline never fires (each container is new) and nothing in the
+store changes, so no controller ends it: it lasts until someone deletes the
+assignment or cancels the job. The stale-epoch test is right for what it was
+written for; it assumes that an assignment older than its run cannot exist.
+
+The simulator does not reach this: its scheduler always releases an ended
+run long before the simulated hour, so J2 never sees a reused name with an
+old assignment.
+
+**How likely.** It needs an assignment that outlives its job by an hour: a
+scheduler that is down or without a leader for that long while retention
+runs, or a node whose allocation is unaccounted or contradictory for that
+long (both are reported by the auditor, neither stops retention), and then
+a second job of the same name. Rare; when it happens it does not heal.
+
+TLC: `finding-job-reuse-assigned` (`ReleasePrompt = FALSE`: retention may
+run while the run is assigned), `J2_StartedOnce`, 16 states. With
+`ReleasePrompt = TRUE` two incarnations hold every property (`jobs-reuse`).
+
+**Trace** (`finding-job-reuse-assigned`):
+
+```
+ 2 Submit           incarnation 1: job, run, status pending
+ 3-6                a1 registers on L1, held, marked ready
+ 7 SPlan a1         the scheduler reads: pending, no stop, a1 ready
+ 8 Cancel           a client cancels the job
+ 9 SCommit          /assigned/a1/<id> written, epoch 1 (the run has no stop yet)
+10 CStopCancel      the controller writes the run's stop
+11 CEndUnstarted    no claim: status cancelled
+12 Retention        job, run, status deleted.  The assignment stays.
+13 Submit           incarnation 2: the same run id, a new create_revision
+14 JClaim a1        a1: served run, assignment (epoch 1), no record: claims
+                    under epoch 1 and starts.  starts = 1
+15 JDropStale a1    next pass: record and container are "older than the run":
+                    container killed, record dropped, observation not seen
+16 JClaim a1        claims and starts again.  starts = 2: J2_StartedOnce
+```
+
+(The cancel is only TLC's shortest way to an ended job with an assignment;
+any ending does.)
+
+**Second form: the old run's ending ends the new job.** If the old run was
+started and ended on the node, the agent still has its record and its ended
+container when retention deletes the job together with the node's
+observation. On its next pass the agent finds no observation of the ending
+(`seen_of`, `src/agent_jobs.zig:329`) and reports it again (`stopped`, 664;
+`report`, 1083). The report compares the tenure and the assignment at its
+epoch, both unchanged, and not the run, so the store accepts it whether or
+not a run of that id exists. Once the name is submitted again, the job
+controller reads a stopped observation from the node's current tenure under
+the epoch the run id is assigned at: `admissible`
+(`src/job_controller.zig:776`) compares the node key's revision, the
+assignment's revision and the node's readiness, and nothing of the run. The
+new job goes from `pending` to `exited` (or `failed`) with the old run's
+exit code and was never started (J11). If the agent's pass comes after the
+submit instead, it is the first form.
+
+TLC: `finding-job-reuse-report`, `J11_ExitedWasStarted`, 16 states. The two
+configs differ only in which of the two invariants they check, so that each
+reports one result at the same depth.
+
+**Trace** (`finding-job-reuse-report`):
+
+```
+ 2-5              a1 registers on L1, held, marked ready
+ 6 Submit           incarnation 1: job, run, status pending
+ 7-8 SPlan, SCommit /assigned/a1/<id> written, epoch 1
+ 9 JClaim a1        claims and starts
+10 JExit a1         the container exits
+11 JReport a1       observation: stopped, exit, tenure of a1, epoch 1
+12 CEndReport       status exited
+13 Retention        job, run, status and the observation deleted.
+                    The assignment stays.
+14 JReport a1       record and ended container are there, the observation
+                    is not: reports stopped again under epoch 1.  Accepted.
+15 Submit           incarnation 2: the same run id, status pending
+16 CEndReport       the observation is admissible: status exited.
+                    No start in incarnation 2: J11_ExitedWasStarted
+```
+
+**Suggested repair:** make the deletion and the assignment exclusive.
+Either `drop_job` reads the run's assignment and leaves the job for a later
+pass while one exists (compare its absence in the transaction), or the job
+controller's create refuses or waits while `/assigned/*/<name>-job` exists.
+On the agent, a claim whose subject epoch is older than the run's
+`create_revision` can be refused locally: that assignment is not of this
+run. For the second form, `admissible` can refuse an observation whose
+assignment epoch is older than the run's `create_revision`, which is the
+agent's own `is_stale_epoch` test on the controller's side.
+
+## 6. A lost state directory leaves job containers that nothing stops
+
+docs/core.md says what the simulator's disk loss does not cover: "a state
+directory removed by hand while the host and its containers stay up", and
+that J1, J8 and I1b fail on it in the simulator because the simulated
+runtime keeps its container records in that directory. The model has no such
+artefact (the runtime lists its containers whatever happens to the agent's
+directory) and shows what is left of the problem in the real design.
+
+An agent that starts and finds no lease file takes it for "a first start or
+a finished fence" (`src/agent.zig:811-815`) and fences nothing. The job
+containers of the previous agent process still run. With the start records
+gone, nothing on the node knows their deadlines: the offline deadline
+(`Agent.before_call`) works from the start record. Once the agent has
+registered, its pass finds a container with no record (`unknown`), stops it
+and reports the run lost, so the damage is bounded by the time to register.
+If the store cannot be reached, there is no such pass: the containers run
+with no fence and no deadline while the node's old lease expires, the node
+is declared lost and the job controller ends the job.
+
+TLC: `finding-job-dirloss` (`AllowDirLoss = TRUE`), `J8_Deadline`, 15 states.
+J1 follows once the node is declared lost and the job ended. The config does
+not check J1, because the model ends a job at once when its claim's node key
+is written again (README, "the tenure-ended wait"), which is right only while
+an agent life cannot outlive its tenure unfenced, and this fault is exactly
+that.
+
+**Trace** (`finding-job-dirloss`):
+
+```
+ 2-5                a1 registers on L1, held, marked ready
+ 6-8                job submitted, placed on a1
+ 9 JClaim a1        a1 claims and starts the container
+10 Tick             running for 1
+11 JDirLoss a1      state directory lost, agent process restarted: no lease
+                    file, no start record; phase idle, no fence.  The
+                    container runs
+12-15 Tick x4       a1 does not reach the store.  Running for 5 > deadline 2
+                    + grace 1 + kill latency 1: J8_Deadline
+```
+
+This is a known cut of the simulator rather than something it gets wrong;
+it is here because the trace needs no artefact of a simulated runtime. For
+replica containers the same step gives an unfenced container on a lost node
+(I1b); the model's slot containers were not extended to show it.
+
+**Suggested repair:** an agent that starts with no lease file and finds
+containers with its labels treats it as a lost tenure and fences them before
+it registers (the runtime's listing, not the state directory, is the witness
+that this is not a first start).
+
 ## Smaller differences between authority.md and the code
 
 - **`mark_lost` time.** authority.md says the node is declared lost "at
@@ -424,6 +605,16 @@ does not wait for a reconcile step.
   `src/agent_fence_test.zig`: with a fence window of `ttl / 3` the agent
   fences on every lease and never settles. The rule of 2026-11-06
   (`src/fencing.zig:78-83`) passes in the same constants (`live-short-window`).
+- **J7's "the run has no stop".** core.md's J7 says each start has a
+  committed claim "and the run has no stop". The agent judges that on the run
+  as its pass read it: `claim` returns if the run has a stop, then writes the
+  claim (which compares the run's revision), fetches the input and starts
+  (`src/agent_jobs.zig:724`, `begin`); a later pass that finds
+  `claimed_unstarted` tests the run it read at its own start. A stop that
+  commits after the claim and before the start is not seen by that start. It
+  is seen on the next pass and honoured within the grace (J6 holds), so what
+  the code keeps is "no stop when the claim committed", up to one pass. The
+  model has it the same way.
 
 ## What TLC did not find
 
@@ -432,3 +623,12 @@ I7, the 2026-11-08 rule, `TimedOutPutIsDead` and both liveness properties
 hold, under call loss, delay, late replies, timeouts, stale keepalives,
 crashes, reboots, two schedulers, and skew up to the bound. That is a statement about the model at these sizes, with
 the cuts the README lists.
+
+For jobs: with the scheduler releasing ended runs before retention and no
+state directory lost under a running agent (findings 5 and 6), J1 to J3 and
+J5 to J11 hold on one node under call loss, timeouts, late replies, expiry,
+reboots with and without the state directory, cancels at any moment, slow
+input fetches and, in `jobs-reuse`, a second incarnation of the name. J4 is
+not expressible. The job configs have one job and no clock error. Two nodes
+are checked with call loss and expiry only (`jobs-two-nodes`); reboots,
+cancels and slow fetches are checked on one node.

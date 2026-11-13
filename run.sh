@@ -55,11 +55,14 @@ for name in "${names[@]}"; do
     [ -f "$cfg" ] || { echo "run.sh: no such config: $cfg" >&2; exit 2; }
     expected=$(sed -n '2s/^\\\* EXPECT //p' "$cfg")
     [ -n "$expected" ] || { echo "run.sh: $cfg: the second line must be '\\* EXPECT ...'" >&2; exit 2; }
+    # A config says which module it checks on a line "\* MODULE <name>"; Fencing if none.
+    module="$(sed -n 's/^\\\* MODULE //p' "$cfg" | head -1)"
+    module="${module:-Fencing}.tla"
     log="out/${name}.out"
     rm -rf "out/${name}.states"
     start=$SECONDS
     java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers auto -difftrace -nowarning \
-        -metadir "out/${name}.states" -config "$cfg" Fencing.tla >"$log" 2>&1 || true
+        -metadir "out/${name}.states" -config "$cfg" "$module" >"$log" 2>&1 || true
     elapsed=$((SECONDS - start))
     rm -rf "out/${name}.states"
     if grep -q 'Model checking completed. No error has been found.' "$log"; then
