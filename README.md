@@ -501,7 +501,7 @@ ones. The liveness configs are smaller than `rollout-base`, because TLC
 checks liveness slowly: `rollout-live` has no pause or resume,
 `rollout-live-user` one apply. `rollout-live-full` (two applies, one pause
 or resume, one fault) is marked slow and runs with `./run.sh --slow`: it
-passed, 671,841 generated, 128,896 distinct, depth 27, 508 s.
+passed, 944,775 generated, 184,641 distinct, depth 28, 816 s.
 
 **With and without the unready retirement rule** (`retire_unready`, added in
 slice 6): safety is the same without it (`rollout-no-unready`). Every
