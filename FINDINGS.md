@@ -869,3 +869,23 @@ input fetches and, in `jobs-reuse`, a second incarnation of the name. J4 is
 not expressible. The job configs have one job and no clock error. Two nodes
 are checked with call loss and expiry only (`jobs-two-nodes`); reboots,
 cancels and slow fetches are checked on one node.
+
+For rollouts (`Rollout.tla`, the design of the brief with the replica
+controller evaluating the budget itself): R1, R2, R4 and R8 hold with
+surge 1 and with unavailable 1, across lost replicas, replicas that turn
+unready, pause and resume, a scale, bad releases, automatic rollback and a
+new apply over a rollout in flight; a rollout of a service that has an
+earlier generation always ends; and the unready retirement rule changes no
+safety check. One service, replicas as counts, no clock, no placement, and
+the recreate policy is not modelled. The lease and fencing model is not
+composed with it: a replica of a node that is dead and not yet declared
+lost counts as ready here, as it does to the controller.
+
+For mesh addresses (`Mesh.tla`): no interleaving of two requests in flight
+over six creates and deletes of two names gives one address to two live
+services, reuses one inside the quarantine or while a replica record of its
+old service is left, leaks one or deletes a hold; and every request ends.
+The compare-and-set race that review B of C4 slice 1 found untested has no
+bad outcome in the model, with both compares or with either one. The block
+is 2 addresses with 2 probes; the store never fails; clocks are right
+(finding 10 is the model with one that is not).

@@ -15,6 +15,11 @@ sim-c1 simulator and shares nothing with it.
 `docs/core.md`), from the job controller, the scheduler, retention and the
 agent's job path at the same commit: see [Jobs](#jobs).
 
+`Rollout.tla` is the rollout budget and state machine of C3, and `Mesh.tla`
+the mesh address allocation of C4 slice 1, each from its own branch of
+Zigcube and each a module of its own: see [Rollouts](#rollouts) and
+[Mesh addresses](#mesh-addresses).
+
 **What TLC found is in [FINDINGS.md](FINDINGS.md).** Read that first.
 
 ## How to run
@@ -384,8 +389,11 @@ simulator's own ledger).
 
 - `Fencing.tla`: the lease, fencing and authority model.
 - `Jobs.tla`: jobs, on top of it.
+- `Rollout.tla`: the rollout budget and phases (C3).
+- `Mesh.tla`: mesh address allocation and release (C4 slice 1).
 - `configs/*.cfg`: one TLC config each; line 1 says what it is, line 2 what
   TLC must report, `\* SLOW` on line 3 keeps it out of the default run,
-  `\* MODULE Jobs` on line 3 marks a config of `Jobs.tla`.
+  `\* MODULE <name>` on line 3 marks a config of another module than
+  `Fencing.tla`.
 - `run.sh`: the runner. `.github/workflows/tlc.yml`: CI.
 - `FINDINGS.md`: what TLC found, with traces and the places in Zigcube.
