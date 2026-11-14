@@ -323,6 +323,13 @@ M2_HoldNamesHolder ==
         svc[n] # None => /\ hold[svc[n].addr].svc = n
                          /\ hold[svc[n].addr].rel = None
 
+\* M2b: and a hold that is not released is its live service's address: no
+\* address leaks.
+M2b_NoLeak ==
+    \A a \in Addrs :
+        (hold[a].rev # 0 /\ hold[a].rel = None) =>
+            (svc[hold[a].svc] # None /\ svc[hold[a].svc].addr = a)
+
 \* M3: an address is not taken within the quarantine of its release, in
 \* real time.
 M3_Quarantine == ~early
