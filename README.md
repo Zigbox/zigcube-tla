@@ -25,7 +25,7 @@ Zigcube and each a module of its own: see [Rollouts](#rollouts) and
 ## How to run
 
 ```sh
-./run.sh                  # every config but the slow ones; about 45 minutes on 4 cores (16 fencing, 13 jobs, 23 rollout, 12 mesh)
+./run.sh                  # every config but the slow ones; about 45 minutes on 4 cores (16 fencing, 13 jobs, 24 rollout, 12 mesh)
 ./run.sh --slow           # the slow ones too; about 25 minutes more
 ./run.sh base teeth-skew  # only these
 ```
