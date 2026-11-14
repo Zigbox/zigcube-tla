@@ -15,13 +15,18 @@ sim-c1 simulator and shares nothing with it.
 `docs/core.md`), from the job controller, the scheduler, retention and the
 agent's job path at the same commit: see [Jobs](#jobs).
 
+`Rollout.tla` is the rollout budget and state machine of C3, and `Mesh.tla`
+the mesh address allocation of C4 slice 1, each from its own branch of
+Zigcube and each a module of its own: see [Rollouts](#rollouts) and
+[Mesh addresses](#mesh-addresses).
+
 **What TLC found is in [FINDINGS.md](FINDINGS.md).** Read that first.
 
 ## How to run
 
 ```sh
-./run.sh                  # every config but the slow one; about 30 minutes on 4 cores (16 fencing, 13 jobs)
-./run.sh --slow           # the slow one too; about 15 minutes more
+./run.sh                  # every config but the slow ones; about an hour on 4 cores (16 fencing, 13 jobs, 29 rollout, 12 mesh)
+./run.sh --slow           # the slow ones too; about 25 minutes more
 ./run.sh base teeth-skew  # only these
 ```
 
@@ -380,12 +385,253 @@ The simulator's teeth with no counterpart: `job_gap` (J4), `deadline_late`
 stops after 512 jobs: the model has one) and `job_ledger_small` (the
 simulator's own ledger).
 
+## Rollouts
+
+`Rollout.tla` is Zigcube's rolling update (C3): the budget a rollout gives
+the replica controller, and the rollout's phases. It was written from
+`docs/briefs/c3.md` ("Controller design" and the checks R1, R2, R4, R7 and
+R8), `src/rollout_plan.zig`, `docs/keys.md` (`/rollouts`) and the decision
+`2026-11-13-c3-slice6-rollout-plan.md` at Zigcube commit `2954195` (branch
+`claude/c3-slice6-rollout-plan`).
+
+At that commit the pure plan (slice 6) and the keys (slice 5) exist; the two
+controllers that use them (slice 7) do not. The module therefore models the
+design the brief gives them, and is a check of that design ahead of the
+code. It stands alone: it does not extend `Fencing.tla` (see "What is
+abstracted away" below for where the two meet).
+
+### What is modelled
+
+| Part | In the model |
+|---|---|
+| The service | Its generation, its replica count, whether an apply or a rollback wrote it. A user applies a new generation (good, or bad: its replicas never turn ready), scales, pauses and resumes. A scale makes no generation. |
+| Replicas | Counted by generation and state: starting, ready, unready for good, stopping (live until seen stopped). |
+| `rollout_plan.budget` | `start`, `retire` and `retire_unready` exactly as the function computes them for a rolling policy, with `done`. |
+| The rollout controller | One pass is one transaction: it begins a rollout when the service's generation is not the record's target (from any phase), completes it, applies a pause or resume, and writes the budget. Failure (ready timeout, a held replica, the progress deadline) fails it or pauses it, by `on_failure`. |
+| The automatic rollback | The API's rollback handler: a new generation with the spec of the one before, compared on the service's revision. |
+| The replica controller | Starts and retires within the budget (`Spend` says which budget: FINDINGS.md 7), only while the rollout runs and only for the record's target. With `Spend = "recheck"` it reads, computes the budget, and commits later in a transaction that compares the records (`Compares = "records"`) or also every `/observed` and node key it counted (`"counted"`); `"atomic"` reads and commits in one step. Failure replacement never waits for the budget; while paused it starts a replica of the lost one's generation (`ReplaceSameGen`, FINDINGS.md 11). Outside a rollout a scale down stops the extra replicas. |
+| Faults | A replica is lost (its node was lost and it is marked so, or it crashed for good); a ready replica turns unready for good. |
+
+### What is abstracted away
+
+- **Time.** There is no clock. The progress deadline and the ready timeout
+  are actions that may fire while the rollout is not done; in the liveness
+  configs they do fire if it stays not done. `min_ready_ms`, the deadline
+  arithmetic of a pause and the restart count are not modelled.
+- **The lease and fencing model.** `Lose` is the step after
+  `Fencing.tla`'s `MarkLost`: the replica is gone from the controller's
+  count. Between a node's death and that mark, the records count a dead
+  replica as ready. R1 is on the controller's view, as the brief words it,
+  so that window (I1b's, seconds) is outside it: the real number of ready
+  replicas can be lower than the view's by the replicas of nodes not yet
+  declared lost. The modules are not composed.
+- **One service, replicas as counts.** Which replica is retired among equals
+  does not matter to the checks. Placement, and so "surge cannot be placed",
+  is not modelled.
+- **Recreate.** Only the rolling policy; the brief says R1 does not hold for
+  recreate.
+- **How a pause arrives.** `/rollouts` has one writer, so a pause is an
+  intent the rollout controller applies on its next pass. The brief does not
+  say where the intent is kept.
+- **The rollout controller's pass is atomic.** That is the best it can be;
+  finding 7 does not depend on a stale rollout controller.
+- **The replica controller's read and commit.** `rollout-base` checks them
+  as two steps with every counted key compared (`Compares = "counted"`).
+  The other passing configs use `Compares = "atomic"`: a commit that
+  compares every key it counted happens only on the state it read, so it is
+  the read and the act in one step, and a failed commit changes nothing. It
+  is the smaller model (`rollout-base` split is about 2.7 times its atomic size: 4.78M distinct states against 1.76M).
+  Failure replacement and the scale-down trim are atomic, and wait while a
+  budgeted transaction is in flight (one process). The compare is on
+  values, not revisions; that only lets more commits through.
+- **The rollback's compare** is on the generation; the brief's is on the
+  service record's revision. They differ after a scale, which no liveness
+  config makes: rollback after a scale is not checked.
+
+### Properties
+
+| Name | Brief | Statement |
+|---|---|---|
+| `R1_MinAvailable` | R1 | no retirement by a rollout leaves fewer ready replicas than `desired - max_unavailable`, on the replica controller's view when it acts |
+| `R1_ReadyFloor` | R1 | with no fault and no scale, ready replicas are at least `desired - max_unavailable` in every state |
+| `R2_SurgeBound` | R2 | no start (by the budget or as failure replacement) leaves more live replicas than `desired + max_surge` |
+| `R2_LiveCeiling` | R2 | live replicas are at most `desired + max_surge` in every state (configs without a scale) |
+| `R4_PauseHolds` | R4 | while the record is paused the rollout starts and retires nothing, and failure replacement starts only the lost replica's generation |
+| `R4_NoBudgetAtRest` | R4 | a record that is paused, failed or complete carries no budget |
+| `R8_UserWins` | R8 | an automatic rollback never replaces a newer apply |
+| `R7_RolloutEnds` | R7 | a rollout always ends: complete, paused, or failed with its rollback made (liveness). With the deadline on, the deadline alone ends every stall, so only the `-no-deadline` configs check progress |
+| `R7_Completes` | R7 | with good releases, no pause and no deadline, the rollout completes (liveness) |
+
+R3 (history), R5 and R6 of the brief are about records the model does not
+have.
+
+Under the settings of the passing configs, `R1_MinAvailable`,
+`R2_SurgeBound`, `R4_PauseHolds` and `R8_UserWins` are the controllers' own
+guards (`Budget.r > 0` implies `ready - 1 >= ready_min`; the start and
+replacement guards; the phase check and same-generation replacement; the
+rollback's compare), so in those configs they hold by construction. What
+they are needed against is shown by the finding and teeth configs, which
+turn one rule off each. The state invariants (`R1_ReadyFloor`,
+`R2_LiveCeiling`, `R4_NoBudgetAtRest`) and R7 are checks with content of
+their own.
+
+### Results
+
+| Config | Checks | Result | Generated | Distinct | Depth | Time (4 cores) |
+|---|---|---|---|---|---|---|
+| `rollout-base` | all invariants, `Compares = "counted"`; surge 1, unavailable 0; two applies (good or bad), two of pause, resume; two faults; a new rollout over one in flight | pass | 28,496,912 | 4,782,192 | 43 | 198 s |
+| `rollout-unavailable` | the same with surge 0, unavailable 1 | pass | 3,322,507 | 574,937 | 28 | 38 s |
+| `rollout-scale` | all but `R2_LiveCeiling`; the user also scales between 1 and 3; one fault | pass | 18,899,960 | 3,155,465 | 35 | 233 s |
+| `rollout-floor` | all invariants and `R1_ReadyFloor`; no faults | pass | 243,246 | 57,220 | 27 | 5 s |
+| `rollout-first` | all invariants; a new service, its first generation good or bad | pass | 47,313,558 | 6,915,783 | 30 | 495 s |
+| `rollout-pause-policy` | all invariants; `on_failure pause` | pass | 1,170,635 | 200,871 | 24 | 15 s |
+| `rollout-no-unready` | all invariants; no unready retirement rule | pass | 5,603,078 | 1,008,183 | 31 | 43 s |
+| `rollout-once-quiet` | all invariants; `Spend = "once"`, no fault, no scale | pass | 133,421 | 32,479 | 30 | 2 s |
+| `rollout-once-no-target-check` | the same, and a budget is spent whatever its target | pass | 135,629 | 32,843 | 29 | 2 s |
+| `rollout-live` | `R7_RolloutEnds`; two applies, one fault | pass | 180,600 | 41,861 | 25 | 195 s |
+| `rollout-live-user` | `R7_RolloutEnds`; one apply, one fault, two of pause, resume | pass | 95,256 | 18,701 | 23 | 17 s |
+| `rollout-live-pause-policy` | `R7_RolloutEnds`; `on_failure pause` | pass | 19,353 | 4,881 | 19 | 20 s |
+| `rollout-live-no-unready` | `R7_RolloutEnds`; no unready retirement rule | pass | 109,684 | 27,409 | 25 | 75 s |
+| `rollout-live-no-deadline` | `R7_RolloutEnds` with `UseDeadline = FALSE`; two applies, one fault | pass | 50,025 | 14,293 | 33 | 60 s |
+| `rollout-live-user-no-deadline` | `R7_RolloutEnds` with `UseDeadline = FALSE`; one apply, one fault, two of pause, resume | pass | 35,146 | 8,068 | 25 | 8 s |
+| `rollout-completes` | `R7_Completes`; good releases, old replicas may go unready, no deadline | pass | 38,787 | 9,061 | 21 | 45 s |
+
+`Spend = "recheck"` in every passing config but the two `rollout-once-*`
+ones. The liveness configs are smaller than `rollout-base`, because TLC
+checks liveness slowly: `rollout-live` has no pause or resume,
+`rollout-live-user` one apply. `rollout-live-full` (two applies, one pause
+or resume, one fault) is marked slow and runs with `./run.sh --slow`: it
+passed, 944,775 generated, 184,641 distinct, depth 28, 816 s.
+
+**With and without the unready retirement rule** (`retire_unready`, added in
+slice 6): safety is the same without it (`rollout-no-unready`). Every
+rollout still ends without it (`rollout-live-no-unready`), but only because
+the deadline fails it: with the deadline taken away, a rollout whose old
+generation has a replica that is running and unready never retires that
+replica and never completes (`teeth-rollout-no-unready-stalls`), where with
+the rule it does (`rollout-completes`).
+
+| Teeth config | What is taken away | TLC reports |
+|---|---|---|
+| `teeth-rollout-no-phase-check` | the replica controller spends budget only while the rollout runs | `R4_PauseHolds` violated (1,228 states) |
+| `teeth-rollout-no-cas` | the automatic rollback compares the service revision | `R8_UserWins` violated (785 states) |
+| `teeth-rollout-replace-ignores-stopping` | failure replacement counts a stopping replica as live | `R2_SurgeBound` violated (17,373 states) |
+| `teeth-rollout-no-unready-stalls` | the unready retirement rule, with no deadline | `R7_Completes` violated (969 states) |
+| `teeth-rollout-no-start` | the replica controller's budgeted starts (a mutant: `MayStart <- Off`), with no deadline | `R7_RolloutEnds` violated (480 states) |
+
+State counts in the teeth and finding tables are about: with several
+workers, where TLC stops on a violation varies from run to run.
+
+The `finding-rollout-*` configs are FINDINGS.md 7, 8 and 11.
+
+## Mesh addresses
+
+`Mesh.tla` is the allocation of mesh addresses (C4 slice 1): the address in
+127.77.0.0/16 a service takes when it is first written, its release when the
+service is deleted, the 24-hour quarantine, the 500 probes and ZC-E0207. It
+was written from `src/mesh_address.zig`, `src/apply.zig` (`apply`,
+`delete_service`), `src/api.zig` (`apply_attempts_max`) and the decision
+`2026-11-13-mesh-address-allocation.md` at Zigcube commit `18e9838` (branch
+`claude/c4-slice1`). It does not use `src/mesh_address_test.zig`. It models
+the probe order of that commit (consecutive numbers); the branch's head
+since review, `b9ae3bd`, spreads half its probes over the block, which is
+not modelled (FINDINGS.md 9).
+
+### What is modelled
+
+The store is linearizable: a read is one step, a transaction is one step and
+commits only if every key it compares is at the revision that was read
+(revision 0: the key must not exist). An API request is several reads and
+one transaction, and any number of other requests may commit between its
+steps. That is the race the slice's review found untested in the code: two
+or more creates and deletes in flight, each having read the counter and the
+holds at different moments.
+
+| Part | In the model |
+|---|---|
+| A create | `CStart` reads the service (one that has an address keeps it); `CCounter` reads `/mesh-address-next`; `CProbe` reads one hold per step, up to `ProbesMax`; `CReplicas` looks for replicas of a released hold's service; `CCommit` is the transaction, comparing the service, the counter and the hold. A refused transaction is planned again from fresh reads, `AttemptsMax` times, then ZC-E0105. |
+| A delete | `DStart` reads the service; `DHold` reads the hold of its address (a hold that names another service, or is released, is left alone); `DCommit` deletes the service and stamps the hold released, comparing both. |
+| The block | `1..AddrMax` with the wrap, for 1..65,534. The counter is not advanced by a refusal. |
+| The quarantine | `Quarantine` ticks, measured as the code does: the server's wall clock at the create against the stamp of the release. |
+| Replicas | A live service gets replica records; they go at any time. A hold's service is looked up by name. |
+| Faults | The server's wall clock steps forward (`ClockStep`, off in the passing configs). |
+
+Not modelled: the store failing; `history.delete_all` before a delete (its
+own transactions); the service record's other fields and updates of a
+service that has an address (one read, no allocation); two API servers with
+different clocks (a step of one clock gives the same traces).
+
+Where the lease and fencing model matters: a replica "remains" while a
+record of it does, which is what the code reads. That its container is gone
+when its records are is I1b of `Fencing.tla`, seconds against a quarantine
+of a day; the modules are not composed.
+
+### Properties
+
+| Name | Statement |
+|---|---|
+| `M1_Unique` | no two live services hold one address |
+| `M2_HoldNamesHolder` | the hold of a live service's address names it and is not released |
+| `M2b_NoLeak` | a hold that is not released is its live service's address |
+| `M3_Quarantine` | an address is not taken within the quarantine of its release, in real time |
+| `M4_NoOldReplica` | while a service holds an address, no replica record is left of another service that held it |
+| `M5_HoldsStay` | a hold is never deleted |
+| `M6_ExhaustedMeansFull` | no create is refused ZC-E0207 having passed over an address that was free but for a namesake's replicas (FINDINGS.md 9) |
+| `M7_RequestsEnd` | allocation terminates: every request ends, created, kept, deleted, or refused with ZC-E0105 or ZC-E0207 (liveness) |
+
+### Results
+
+| Config | Checks | Result | Generated | Distinct | Depth | Time (4 cores) |
+|---|---|---|---|---|---|---|
+| `mesh-base` | M1 to M5; every interleaving of 6 creates and deletes, two in flight; the block wraps and addresses are reused | pass | 17,342,620 | 4,785,696 | 47 | 47 s |
+| `mesh-counter-only` | the same without the hold compare | pass | 17,342,620 | 4,785,696 | 47 | 48 s |
+| `mesh-hold-only` | the same without the counter compare | pass | 18,214,618 | 4,982,756 | 48 | 50 s |
+| `mesh-by-incarnation` | M1 to M6 with the repair of finding 9 | pass | 16,856,516 | 4,599,204 | 46 | 43 s |
+| `mesh-live` | `M7_RequestsEnd`; 5 requests | pass | 4,694,922 | 1,244,532 | 38 | 72 s |
+
+Every config has two service names, two requests in flight, a block of 2
+addresses, 2 probes, a quarantine of 2 ticks and 2 attempts
+(`finding-mesh-clock-step`: 1 address).
+
+The compare-and-set race: with both compares the model finds no
+interleaving of creates and deletes that breaks M1 to M5. Either compare
+alone is enough in the model (`mesh-counter-only`, `mesh-hold-only`): every
+create writes the counter, so two creates that read the same counter cannot
+both commit, and every create writes its hold, so two creates of one number
+cannot both commit. With neither, two services take one address within 10 steps
+(`teeth-mesh-no-compare`). The compare of the service key is what keeps two
+creates of one name from each taking an address
+(`teeth-mesh-no-service-compare`: the first address leaks).
+
+| Teeth config | What is taken away | TLC reports |
+|---|---|---|
+| `teeth-mesh-no-compare` | both the counter compare and the hold compare | `M1_Unique` violated (856 states) |
+| `teeth-mesh-no-service-compare` | the compare of `/services/<name>` | `M2b_NoLeak` violated (810 states) |
+| `teeth-mesh-no-quarantine` | the quarantine | `M3_Quarantine` violated (75,551 states) |
+| `teeth-mesh-no-replica-check` | the wait for the old service's replicas | `M4_NoOldReplica` violated (306,813 states) |
+| `teeth-mesh-forget-hold` | the released hold: the delete deletes it | `M5_HoldsStay` violated (327 states) |
+
+State counts in this table are about, as above.
+
+The `finding-mesh-*` configs are FINDINGS.md 9 and 10; `mesh-by-incarnation`
+is the first repair of 9 (the hold names the incarnation); its "no new
+field" variant is not checked.
+
 ## Files
 
 - `Fencing.tla`: the lease, fencing and authority model.
 - `Jobs.tla`: jobs, on top of it.
+- `Rollout.tla`: the rollout budget and phases (C3).
+- `Mesh.tla`: mesh address allocation and release (C4 slice 1).
 - `configs/*.cfg`: one TLC config each; line 1 says what it is, line 2 what
-  TLC must report, `\* SLOW` on line 3 keeps it out of the default run,
-  `\* MODULE Jobs` on line 3 marks a config of `Jobs.tla`.
-- `run.sh`: the runner. `.github/workflows/tlc.yml`: CI.
+  TLC must report, `\* MODULE <name>` on the next line marks a config of
+  another module than `Fencing.tla`, and `\* SLOW` on a line after those
+  keeps it out of the default run. The configs are written by hand (there
+  is no generator): a constant added to a module and missed in a config
+  makes TLC stop with an error, which `run.sh` reports as a failure.
+- `run.sh`: the runner. `.github/workflows/tlc.yml`: CI, which runs
+  `./run.sh` without `--slow`. The slow configs (`both-faulty`,
+  `rollout-live-full`) are run by hand before a change to their module is
+  merged; nothing runs them automatically, which is accepted for now
+  (a scheduled job could).
 - `FINDINGS.md`: what TLC found, with traces and the places in Zigcube.
