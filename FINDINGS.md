@@ -2,7 +2,9 @@
 
 What TLC found when the model follows the Zig code and `docs/authority.md`
 where they differ. File and line numbers are in Zigbox/zigcube at commit
-`f7736a7`. Nothing in Zigcube was changed.
+`f7736a7` for findings 1 to 6, at `2954195` (branch
+`claude/c3-slice6-rollout-plan`) for 7 and 8, and at `18e9838` (branch
+`claude/c4-slice1`) for 9 and 10. Nothing in Zigcube was changed.
 
 Each finding names the config that reproduces it; `./run.sh <config>` leaves
 the full trace in `out/<config>.out`. The traces below are those traces, one
@@ -18,9 +20,13 @@ config `TTL = 6`, the fence is at agent time 3 (`FenceAt = TTL − Margin`), and
 | 4 | The inequality has no term for a late agent step | gap in authority.md, zero slack in the constants | `finding-step-lag` | `I1b_NoOverlap` violated; holds when the lag is under `lost_grace` |
 | 5 | Retention deletes a job without looking at its run's assignment; if the scheduler has not released it and the name is used again, the agent claims under the old assignment and starts the run on every pass, or the old run's ending is reported again and ends the new job | **protocol bug** (J2: a run that never ends; J11: a job ended by another job's report), needs an assignment that outlives its job by an hour | `finding-job-reuse-assigned`, `finding-job-reuse-report` | `J2_StartedOnce` violated; `J11_ExitedWasStarted` violated |
 | 6 | A state directory lost under a running agent: no fence, no start records, the job containers run on | gap the simulator names and does not cover | `finding-job-dirloss` | `J8_Deadline` violated |
+| 7 | The budget in `/rollouts` is a count with no view attached; the replica controller spends it after a node is lost, after a scale, or twice | gap in the C3 brief (slice 7 is not built): R1 and R2 fail | `finding-rollout-once-fault`, `finding-rollout-once-scale`, `finding-rollout-once-surge`, `finding-rollout-stored-r1`, `finding-rollout-stored-r2` | `R1_MinAvailable`, `R2_SurgeBound` violated; hold when the replica controller evaluates the budget on its own read |
+| 8 | A first generation that fails has nothing to roll back to and stays `failed` with the rollback owed | R7 does not hold as worded (the slice-6 decision names the case) | `finding-rollout-first-generation` | `R7_RolloutEnds` violated |
+| 9 | A mesh address released by a service whose name is in use again is never reusable; ZC-E0207 with free addresses, and then for every create | **protocol bug** (availability, after the counter wraps) | `finding-mesh-namesake` | `M6_ExhaustedMeansFull` violated; holds with the hold named by incarnation |
+| 10 | The quarantine is a difference of API-server wall-clock readings | same kind as 3, with a day of room | `finding-mesh-clock-step` | `M3_Quarantine` violated |
 
-With those six faults excluded, every invariant holds in every passing
-config, and TLC caught every safeguard that was taken away (README, teeth
+With those faults excluded (for 7: with the replica controller evaluating
+the budget itself), every invariant holds in every passing config, and TLC caught every safeguard that was taken away (README, teeth
 table).
 
 ## 1. A late registration PUT re-attaches the node key to an orphan lease
@@ -582,6 +588,237 @@ replica containers the same step gives an unfenced container on a lost node
 containers with its labels treats it as a lost tenure and fences them before
 it registers (the runtime's listing, not the state directory, is the witness
 that this is not a first start).
+
+## 7. The stored rollout budget outlives the view it was computed from
+
+Slice 7 of C3 (the rollout controller and the replica controller's use of
+the budget) is not built at `2954195`; this is a finding about the design in
+`docs/briefs/c3.md` ("Controller design") and `docs/keys.md` (`/rollouts`),
+ahead of the code.
+
+The brief has the rollout controller write the plan into `/rollouts` and the
+replica controller obey it: "it starts a new replica only within `may_start`
+and retires an old one only within `may_retire`". The budget in the record
+is three counts (`start`, `retire`, `retire_unready`). A count is true of the
+replicas, the readiness and the service record the rollout controller read.
+The replica controller acts later, in another transaction, and R1 is worded
+on its view: "every retirement by a rollout leaves `ready >= desired -
+max_unavailable` on the controller's view at the revision before it".
+Nothing in the record says which view the count belongs to, so anything that
+changes between the plan and the act is spent against a count that no longer
+holds.
+
+`Rollout.tla` has the switch `Spend` for the ways to read "obeys":
+
+| `Spend` | The replica controller | R1, R2 |
+|---|---|---|
+| `stored` | acts whenever the count in the record is above zero | fail with no fault at all: two passes spend one count twice |
+| `once` | spends each written budget at most once (it remembers the revision) | fail when a replica is lost, or the user scales, between the plan and the act |
+| `recheck` | evaluates `rollout_plan.budget` itself, on the replicas it reads in the transaction that writes `/replicas/` | hold (`rollout-base` and the other passing configs) |
+
+All traces: `desired = 2`, `max_surge = 1`, `max_unavailable = 0` (the
+defaults), so `ready_min = 2` and `live_max = 3`.
+
+**Trace** (`finding-rollout-once-fault`, R1): a lost node between the plan
+and the act.
+
+```
+ 1                  generation 1 is complete: 2 replicas ready
+ 2 Apply            the user applies generation 2
+ 3 RoPass           the rollout begins; budget: start 1, retire 0
+ 4 RcStart          a replica of generation 2 is started (live 3)
+ 5 Ready            it is ready: ready 3
+ 6 RoPass           budget: start 0, retire 1   (ready 3 - ready_min 2)
+ 7 Lose             a node is lost and its generation-1 replica marked
+                    lost: ready 2
+ 8 RcRetire         the replica controller spends "retire 1" on the other
+                    generation-1 replica: ready 1 < 2
+```
+
+The brief allows for the fault ("faults such as a lost node can lower
+`ready` by themselves; the check is that the rollout never causes the
+drop"): step 7 is the fault, and step 8 is the rollout, retiring a ready
+replica when its own view has no ready replica to spare. Zigcube then serves
+from one replica where the policy promised two, until the replacement is
+ready. This is the case the feature exists for: a node dying during a
+deploy.
+
+**Trace** (`finding-rollout-once-scale`, R1): steps 1 to 6 as above, then
+
+```
+ 7 Scale            the user scales to 3: ready_min is now 3, ready is 3
+ 8 RcRetire         "retire 1" is spent: ready 2 < 3
+```
+
+**Trace** (`finding-rollout-once-surge`, R2):
+
+```
+ 2 Apply            generation 2
+ 3 RoPass           budget: start 1
+ 4 Scale            the user scales to 1: live_max is now 2, live is 2
+ 5 RcStart          "start 1" is spent: live 3 > 2
+```
+
+**Traces** (`finding-rollout-stored-r1`, `finding-rollout-stored-r2`): no
+fault and no user.
+
+```
+ 1-6                as above; budget: start 0, retire 1
+ 7 RcRetire         a pass retires one generation-1 replica: ready 2
+ 8 RcRetire         the next pass reads the same record: ready 1 < 2
+```
+
+```
+ 3 RoPass           budget: start 1
+ 4 RcStart          live 3
+ 5 RcStart          the next pass reads the same record: live 4 > 3
+```
+
+With no fault and no scale, `once` holds every check (`rollout-once-quiet`),
+and so does a budget written for one target and spent after a newer apply
+(`rollout-once-no-target-check`): a stale count is only wrong when `ready`,
+`live` or `desired` moved against it.
+
+**Suggested repair:** the replica controller calls `rollout_plan.budget`
+itself, on the replicas, the observed readiness and the service record it
+reads in the transaction that writes `/replicas/`, and acts within that (or
+within the smaller of that and the stored count). It is the only writer of
+`/replicas/`, so its own view of them cannot be stale. The record then
+carries the phase, the target and the deadline, which is what only the
+rollout controller knows, and its `budget` is for `zcube` to show. The
+function is pure and in the core, so nothing new is needed. A cheaper repair
+that keeps the stored count as the authority (the record names the `ready`,
+`live` and `desired` it was computed from, and the replica controller spends
+it only while they still hold) closes the traces above too, and stalls
+whenever they differ.
+
+`sim-c3`'s R1 witness should take a node loss between a `/rollouts` write
+and the next replica controller pass; a witness that only loses nodes
+between passes of both controllers does not see this.
+
+## 8. A failed first generation never ends
+
+R7 as the task and the brief word it: a rollout always ends, complete,
+paused, or failed and then rolled back. With `on_failure rollback` a failed
+apply owes a rollback, and the rollback handler makes a generation from the
+one before. A service's first generation has none before it. The handler
+refuses, the rollout stays `failed` with the rollback owed, and the
+controller calls the handler again on every pass.
+
+The slice-6 decision knows this (item 4: "without the pause it would stay
+`failed` calling it") and lets a user's pause end it. It is here because
+the property fails without a user: `finding-rollout-first-generation`,
+`R7_RolloutEnds` violated.
+
+**Trace** (`finding-rollout-first-generation`):
+
+```
+ 1                  a new service: generation 1 rolls out
+ 2-3 RcStart x2     two replicas started
+ 4 Ready            one is ready
+ 5 RoFail           the progress deadline passes: phase failed, rollback
+                    owed
+ 6 Ready            the second is ready: the service is whole
+ 7 ...              Rollback is refused (from = 0); the record stays failed
+                    and owed, for ever
+```
+
+The image need not be bad: here the first rollout was only slow, both
+replicas are ready one step later, and the record still says `failed` with
+a rollback owed, because done wins over failure only while the rollout is
+running.
+
+**Suggested repair:** `rollout_plan` does not owe a rollback when `from`
+is 0 (the phase is `failed`, the decision says "nothing to roll back to"),
+or treats that failure as `on_failure pause`. Either makes R7 hold as
+worded; the passing liveness configs (`rollout-live*`) are services that
+have a generation to go back to.
+
+## 9. An address released by a name that is in use again is never free
+
+`mesh_address.reusable` (`src/mesh_address.zig:121-128` at `18e9838`) takes
+a released hold when the quarantine has passed and
+`replicas_remain(hold.service)` is false. The hold names its service by
+**name**, and `replicas_remain` (`:132`) looks for any replica record under
+that name. A service that is deleted and applied again takes a new address
+(decision 2026-11-13: "a deleted and re-applied service takes a new
+address"), and its old hold keeps its name. From then on the old address is
+unusable for as long as a service of that name has a replica, which for a
+name like `web` is for ever: the replicas that "remain" are the new
+service's, on another address.
+
+So every delete and re-apply of a name that stays in use costs one address
+for good. The block has 65,534. Two things follow once the counter has
+wrapped:
+
+- A probe passes over addresses that are free in every sense the decision
+  gives (released a day ago, no replica of the service that held them).
+- ZC-E0207 "127.77.0.0/16 has no free address" is raised when 500 numbers in
+  a row are unusable, and with `services_max = 256` that takes at least 244
+  quarantined or name-blocked ones. `exhausted` writes nothing, so the
+  counter stays where it is and **every later create is refused at the same
+  place** until one of those names is deleted and its replicas are gone. A
+  deploy script that replaces one service by delete and apply makes exactly
+  such a run: 500 replacements of `web` with no other create between them
+  are 500 consecutive holds named `web`, 499 of them released, none ever
+  reusable while `web` runs.
+
+It needs 65,534 creates before it shows, which a cluster that redeploys by
+delete and apply reaches in time and one that only updates never does.
+
+TLC: `finding-mesh-namesake`, `M6_ExhaustedMeansFull` violated. The model's
+block is 3 addresses and 2 probes.
+
+**Trace** (`finding-mesh-namesake`; the create of `a` is in flight from
+step 2, which only shortens the trace: its probes are steps 19 to 22):
+
+```
+ 2-3   r1: create a          reads the counter: candidate 1
+ 4-7   r2: create b          b takes address 1; counter 2
+ 9-11  r2: delete b          hold 1 = {b, released at 0}
+13-17  r2: create b          b takes address 2; counter 3.  Clock 1
+18     Tick                  clock 2: hold 1 is out of quarantine
+19     r1 probes 1           released, quarantine passed: look for replicas
+20     RepAppear b           the new b, on address 2, has a replica
+21     r1: replicas of "b"   one remains: address 1 is passed over
+22     r1 probes 2           held by b.  Two probes: ZC-E0207
+```
+
+Address 1 was free and address 3 was never used. With
+`HoldByIncarnation = TRUE` (below) the same config passes
+(`mesh-by-incarnation`).
+
+**Suggested repair:** make the hold name the incarnation, not the name: put
+the service's creation stamp in the hold (the `/rollouts` record already
+carries `service_created` for the same purpose) and have `replicas_remain`
+ask for replicas of that incarnation; or, with no new field, let
+`replicas_remain` ignore the name when a live `/services/<name>` holds a
+different address and was created after `released_at_ms` (its replicas are
+then the new service's, as long as the old one's are gone by the end of the
+quarantine, which I1b bounds in seconds). Separately, `exhausted` could
+advance the counter past the run it probed, so that one bad run does not
+refuse every create.
+
+## 10. The quarantine is a difference of wall-clock readings
+
+`release` stamps `released_at_ms = ctx.clock.now_ms()` on the API server
+that handles the delete, and `reusable` compares it with `now_ms()` on the
+API server that handles a later create (`src/mesh_address.zig:64`,
+`:124-126`). A reading that is behind the stamp is handled (`now <
+released`: not reusable). One that is ahead is not: a server whose clock was
+stepped forward, or two servers whose clocks differ, end the quarantine
+early by that much. It is finding 3 again (absolute wall-clock values in
+the store), with far more room: the quarantine is a day, so it takes a
+clock that is wrong by hours to matter.
+
+TLC: `finding-mesh-clock-step` (`ClockStep = 2 = Quarantine`),
+`M3_Quarantine` violated: address 1 is released at 0, the clock of the
+server steps, and a create takes address 1 at real time 0.
+
+**Suggested repair:** none needed for skew of seconds. If it is to hold
+under a stepped clock, stamp the release with the store's clock (as lease
+deadlines are) or keep the release's store revision and a bound on revision
+age.
 
 ## Smaller differences between authority.md and the code
 
