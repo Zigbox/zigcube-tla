@@ -767,24 +767,26 @@ It needs 65,534 creates before it shows, which a cluster that redeploys by
 delete and apply reaches in time and one that only updates never does.
 
 TLC: `finding-mesh-namesake`, `M6_ExhaustedMeansFull` violated. The model's
-block is 3 addresses and 2 probes.
+block is 2 addresses and 2 probes.
 
-**Trace** (`finding-mesh-namesake`; the create of `a` is in flight from
-step 2, which only shortens the trace: its probes are steps 19 to 22):
+**Trace** (`finding-mesh-namesake`):
 
 ```
- 2-3   r1: create a          reads the counter: candidate 1
- 4-7   r2: create b          b takes address 1; counter 2
- 9-11  r2: delete b          hold 1 = {b, released at 0}
-13-17  r2: create b          b takes address 2; counter 3.  Clock 1
-18     Tick                  clock 2: hold 1 is out of quarantine
-19     r1 probes 1           released, quarantine passed: look for replicas
-20     RepAppear b           the new b, on address 2, has a replica
-21     r1: replicas of "b"   one remains: address 1 is passed over
-22     r1 probes 2           held by b.  Two probes: ZC-E0207
+ 2-5   r1: create a          a takes address 1; counter 2
+ 7-9   r1: delete a          hold 1 = {a, released at 0}
+11-15  r1: create a          a takes address 2; the counter wraps to 1
+14,16  r2: a create          reads the counter: candidate 1
+17     RepAppear a           the new a, on address 2, has a replica
+18-19  Tick x2               clock 2: hold 1 is out of quarantine
+20     r2 probes 1           released, quarantine passed: look for replicas
+21     r2: replicas of "a"   one remains: address 1 is passed over
+22     r2 probes 2           held by a.  Two probes: ZC-E0207
 ```
 
-Address 1 was free and address 3 was never used. With
+Address 1 was free: released a quarantine ago, and no replica of the
+service that held it is left. (In TLC's shortest trace r2 is a second create
+of `a` that read the service before step 15; the name r2 creates plays no
+part, and a create of `b` at step 14 is refused the same way.) With
 `HoldByIncarnation = TRUE` (below) the same config passes
 (`mesh-by-incarnation`).
 
@@ -852,6 +854,21 @@ age.
   is seen on the next pass and honoured within the grace (J6 holds), so what
   the code keeps is "no stop when the claim committed", up to one pass. The
   model has it the same way.
+
+- **Failure replacement and stopping replicas.** The C3 brief says failure
+  replacement "never waits for `may_start`". If it counts live replicas
+  without the stopping ones it starts a replica past `desired + max_surge`
+  (`teeth-rollout-replace-ignores-stopping`, R2). The brief does not say
+  which count it uses; `rollout_plan` counts a stopping replica as live.
+- **Two compares where one would do.** The create's transaction compares
+  both `/mesh-address-next` and the hold. In the model either alone keeps
+  M1 to M5 (`mesh-counter-only`, `mesh-hold-only`). Not a fault: the second
+  is the one that survives a change to how the counter is written.
+- **ZC-E0105 under concurrent creates.** Every create writes the counter, so
+  creates of different services conflict with each other, and one that loses
+  `apply_attempts_max` times in a row is refused ZC-E0105 though nothing
+  else is wrong. The model has it as an outcome (`M7_RequestsEnd` counts it
+  as ending).
 
 ## What TLC did not find
 
