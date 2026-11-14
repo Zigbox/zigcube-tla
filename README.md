@@ -409,7 +409,7 @@ abstracted away" below for where the two meet).
 | `rollout_plan.budget` | `start`, `retire` and `retire_unready` exactly as the function computes them for a rolling policy, with `done`. |
 | The rollout controller | One pass is one transaction: it begins a rollout when the service's generation is not the record's target (from any phase), completes it, applies a pause or resume, and writes the budget. Failure (ready timeout, a held replica, the progress deadline) fails it or pauses it, by `on_failure`. |
 | The automatic rollback | The API's rollback handler: a new generation with the spec of the one before, compared on the service's revision. |
-| The replica controller | Starts and retires within the budget (`Spend` says which budget: FINDINGS.md 7), only while the rollout runs and only for the record's target. Failure replacement never waits for the budget. Outside a rollout a scale down stops the extra replicas. |
+| The replica controller | Starts and retires within the budget (`Spend` says which budget: FINDINGS.md 7), only while the rollout runs and only for the record's target. With `Spend = "recheck"` it reads, computes the budget, and commits later in a transaction that compares the records (`Compares = "records"`) or also every `/observed` and node key it counted (`"counted"`); `"atomic"` reads and commits in one step. Failure replacement never waits for the budget; while paused it starts a replica of the lost one's generation (`ReplaceSameGen`, FINDINGS.md 11). Outside a rollout a scale down stops the extra replicas. |
 | Faults | A replica is lost (its node was lost and it is marked so, or it crashed for good); a ready replica turns unready for good. |
 
 ### What is abstracted away
@@ -435,6 +435,18 @@ abstracted away" below for where the two meet).
   say where the intent is kept.
 - **The rollout controller's pass is atomic.** That is the best it can be;
   finding 7 does not depend on a stale rollout controller.
+- **The replica controller's read and commit.** `rollout-base` checks them
+  as two steps with every counted key compared (`Compares = "counted"`).
+  The other passing configs use `Compares = "atomic"`: a commit that
+  compares every key it counted happens only on the state it read, so it is
+  the read and the act in one step, and a failed commit changes nothing. It
+  is the smaller model (`rollout-base` is about five times as large split).
+  Failure replacement and the scale-down trim are atomic, and wait while a
+  budgeted transaction is in flight (one process). The compare is on
+  values, not revisions; that only lets more commits through.
+- **The rollback's compare** is on the generation; the brief's is on the
+  service record's revision. They differ after a scale, which no liveness
+  config makes: rollback after a scale is not checked.
 
 ### Properties
 
@@ -444,14 +456,24 @@ abstracted away" below for where the two meet).
 | `R1_ReadyFloor` | R1 | with no fault and no scale, ready replicas are at least `desired - max_unavailable` in every state |
 | `R2_SurgeBound` | R2 | no start (by the budget or as failure replacement) leaves more live replicas than `desired + max_surge` |
 | `R2_LiveCeiling` | R2 | live replicas are at most `desired + max_surge` in every state (configs without a scale) |
-| `R4_PauseHolds` | R4 | while the record is paused the rollout starts and retires nothing |
+| `R4_PauseHolds` | R4 | while the record is paused the rollout starts and retires nothing, and failure replacement starts only the lost replica's generation |
 | `R4_NoBudgetAtRest` | R4 | a record that is paused, failed or complete carries no budget |
 | `R8_UserWins` | R8 | an automatic rollback never replaces a newer apply |
-| `R7_RolloutEnds` | R7 | a rollout always ends: complete, paused, or failed with its rollback made (liveness) |
+| `R7_RolloutEnds` | R7 | a rollout always ends: complete, paused, or failed with its rollback made (liveness). With the deadline on, the deadline alone ends every stall, so only the `-no-deadline` configs check progress |
 | `R7_Completes` | R7 | with good releases, no pause and no deadline, the rollout completes (liveness) |
 
 R3 (history), R5 and R6 of the brief are about records the model does not
 have.
+
+Under the settings of the passing configs, `R1_MinAvailable`,
+`R2_SurgeBound`, `R4_PauseHolds` and `R8_UserWins` are the controllers' own
+guards (`Budget.r > 0` implies `ready - 1 >= ready_min`; the start and
+replacement guards; the phase check and same-generation replacement; the
+rollback's compare), so in those configs they hold by construction. What
+they are needed against is shown by the finding and teeth configs, which
+turn one rule off each. The state invariants (`R1_ReadyFloor`,
+`R2_LiveCeiling`, `R4_NoBudgetAtRest`) and R7 are checks with content of
+their own.
 
 ### Results
 
@@ -493,8 +515,12 @@ the rule it does (`rollout-completes`).
 | `teeth-rollout-no-cas` | the automatic rollback compares the service revision | `R8_UserWins` violated (904 states) |
 | `teeth-rollout-replace-ignores-stopping` | failure replacement counts a stopping replica as live | `R2_SurgeBound` violated (16,857 states) |
 | `teeth-rollout-no-unready-stalls` | the unready retirement rule, with no deadline | `R7_Completes` violated (1,216 states) |
+| `teeth-rollout-no-start` | the replica controller's budgeted starts (a mutant: `MayStart <- Off`), with no deadline | `R7_RolloutEnds` violated (497 states) |
 
-The `finding-rollout-*` configs are FINDINGS.md 7 and 8.
+State counts in the teeth and finding tables are about: with several
+workers, where TLC stops on a violation varies from run to run.
+
+The `finding-rollout-*` configs are FINDINGS.md 7, 8 and 11.
 
 ## Mesh addresses
 
@@ -504,7 +530,10 @@ service is deleted, the 24-hour quarantine, the 500 probes and ZC-E0207. It
 was written from `src/mesh_address.zig`, `src/apply.zig` (`apply`,
 `delete_service`), `src/api.zig` (`apply_attempts_max`) and the decision
 `2026-11-13-mesh-address-allocation.md` at Zigcube commit `18e9838` (branch
-`claude/c4-slice1`). It does not use `src/mesh_address_test.zig`.
+`claude/c4-slice1`). It does not use `src/mesh_address_test.zig`. It models
+the probe order of that commit (consecutive numbers); the branch's head
+since review, `b9ae3bd`, spreads half its probes over the block, which is
+not modelled (FINDINGS.md 9).
 
 ### What is modelled
 
@@ -580,8 +609,11 @@ creates of one name from each taking an address
 | `teeth-mesh-no-replica-check` | the wait for the old service's replicas | `M4_NoOldReplica` violated (306,813 states) |
 | `teeth-mesh-forget-hold` | the released hold: the delete deletes it | `M5_HoldsStay` violated (327 states) |
 
+State counts in this table are about, as above.
+
 The `finding-mesh-*` configs are FINDINGS.md 9 and 10; `mesh-by-incarnation`
-is the repair of 9.
+is the first repair of 9 (the hold names the incarnation); its "no new
+field" variant is not checked.
 
 ## Files
 
@@ -590,8 +622,14 @@ is the repair of 9.
 - `Rollout.tla`: the rollout budget and phases (C3).
 - `Mesh.tla`: mesh address allocation and release (C4 slice 1).
 - `configs/*.cfg`: one TLC config each; line 1 says what it is, line 2 what
-  TLC must report, `\* SLOW` on line 3 keeps it out of the default run,
-  `\* MODULE <name>` on line 3 marks a config of another module than
-  `Fencing.tla`.
-- `run.sh`: the runner. `.github/workflows/tlc.yml`: CI.
+  TLC must report, `\* MODULE <name>` on the next line marks a config of
+  another module than `Fencing.tla`, and `\* SLOW` on a line after those
+  keeps it out of the default run. The configs are written by hand (there
+  is no generator): a constant added to a module and missed in a config
+  makes TLC stop with an error, which `run.sh` reports as a failure.
+- `run.sh`: the runner. `.github/workflows/tlc.yml`: CI, which runs
+  `./run.sh` without `--slow`. The slow configs (`both-faulty`,
+  `rollout-live-full`) are run by hand before a change to their module is
+  merged; nothing runs them automatically, which is accepted for now
+  (a scheduled job could).
 - `FINDINGS.md`: what TLC found, with traces and the places in Zigcube.
