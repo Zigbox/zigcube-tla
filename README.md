@@ -25,7 +25,7 @@ Zigcube and each a module of its own: see [Rollouts](#rollouts) and
 ## How to run
 
 ```sh
-./run.sh                  # every config but the slow ones; about 45 minutes on 4 cores (16 fencing, 13 jobs, 24 rollout, 12 mesh)
+./run.sh                  # every config but the slow ones; about an hour on 4 cores (16 fencing, 13 jobs, 29 rollout, 12 mesh)
 ./run.sh --slow           # the slow ones too; about 25 minutes more
 ./run.sh base teeth-skew  # only these
 ```
@@ -440,7 +440,7 @@ abstracted away" below for where the two meet).
   The other passing configs use `Compares = "atomic"`: a commit that
   compares every key it counted happens only on the state it read, so it is
   the read and the act in one step, and a failed commit changes nothing. It
-  is the smaller model (`rollout-base` is about five times as large split).
+  is the smaller model (`rollout-base` split is about 2.7 times its atomic size: 4.78M distinct states against 1.76M).
   Failure replacement and the scale-down trim are atomic, and wait while a
   budgeted transaction is in flight (one process). The compare is on
   values, not revisions; that only lets more commits through.
@@ -479,20 +479,22 @@ their own.
 
 | Config | Checks | Result | Generated | Distinct | Depth | Time (4 cores) |
 |---|---|---|---|---|---|---|
-| `rollout-base` | all invariants; surge 1, unavailable 0; two applies (good or bad), two of pause, resume; two faults; a new rollout over one in flight | pass | 5,873,925 | 940,825 | 29 | 54 s |
-| `rollout-unavailable` | the same with surge 0, unavailable 1 | pass | 1,831,912 | 314,096 | 26 | 18 s |
-| `rollout-scale` | all but `R2_LiveCeiling`; the user also scales between 1 and 3; one fault | pass | 13,490,026 | 2,172,656 | 35 | 138 s |
+| `rollout-base` | all invariants, `Compares = "counted"`; surge 1, unavailable 0; two applies (good or bad), two of pause, resume; two faults; a new rollout over one in flight | pass | 28,496,912 | 4,782,192 | 43 | 198 s |
+| `rollout-unavailable` | the same with surge 0, unavailable 1 | pass | 3,322,507 | 574,937 | 28 | 38 s |
+| `rollout-scale` | all but `R2_LiveCeiling`; the user also scales between 1 and 3; one fault | pass | 18,899,960 | 3,155,465 | 35 | 233 s |
 | `rollout-floor` | all invariants and `R1_ReadyFloor`; no faults | pass | 243,246 | 57,220 | 27 | 5 s |
-| `rollout-first` | all invariants; a new service, its first generation good or bad | pass | 21,179,704 | 2,953,820 | 28 | 186 s |
-| `rollout-pause-policy` | all invariants; `on_failure pause` | pass | 648,118 | 105,662 | 22 | 9 s |
-| `rollout-no-unready` | all invariants; no unready retirement rule | pass | 2,742,231 | 481,844 | 28 | 17 s |
+| `rollout-first` | all invariants; a new service, its first generation good or bad | pass | 47,313,558 | 6,915,783 | 30 | 495 s |
+| `rollout-pause-policy` | all invariants; `on_failure pause` | pass | 1,170,635 | 200,871 | 24 | 15 s |
+| `rollout-no-unready` | all invariants; no unready retirement rule | pass | 5,603,078 | 1,008,183 | 31 | 43 s |
 | `rollout-once-quiet` | all invariants; `Spend = "once"`, no fault, no scale | pass | 133,421 | 32,479 | 30 | 2 s |
-| `rollout-once-no-target-check` | the same, and a budget is spent whatever its target | pass | 135,629 | 32,843 | 29 | 3 s |
-| `rollout-live` | `R7_RolloutEnds`; two applies, one fault | pass | 128,614 | 29,467 | 25 | 119 s |
-| `rollout-live-user` | `R7_RolloutEnds`; one apply, one fault, two of pause, resume | pass | 67,650 | 12,981 | 23 | 13 s |
-| `rollout-live-pause-policy` | `R7_RolloutEnds`; `on_failure pause` | pass | 13,874 | 3,335 | 19 | 15 s |
-| `rollout-live-no-unready` | `R7_RolloutEnds`; no unready retirement rule | pass | 74,782 | 18,661 | 24 | 45 s |
-| `rollout-completes` | `R7_Completes`; good releases, old replicas may go unready, no deadline | pass | 20,664 | 4,557 | 20 | 23 s |
+| `rollout-once-no-target-check` | the same, and a budget is spent whatever its target | pass | 135,629 | 32,843 | 29 | 2 s |
+| `rollout-live` | `R7_RolloutEnds`; two applies, one fault | pass | 180,600 | 41,861 | 25 | 195 s |
+| `rollout-live-user` | `R7_RolloutEnds`; one apply, one fault, two of pause, resume | pass | 95,256 | 18,701 | 23 | 17 s |
+| `rollout-live-pause-policy` | `R7_RolloutEnds`; `on_failure pause` | pass | 19,353 | 4,881 | 19 | 20 s |
+| `rollout-live-no-unready` | `R7_RolloutEnds`; no unready retirement rule | pass | 109,684 | 27,409 | 25 | 75 s |
+| `rollout-live-no-deadline` | `R7_RolloutEnds` with `UseDeadline = FALSE`; two applies, one fault | pass | 50,025 | 14,293 | 33 | 60 s |
+| `rollout-live-user-no-deadline` | `R7_RolloutEnds` with `UseDeadline = FALSE`; one apply, one fault, two of pause, resume | pass | 35,146 | 8,068 | 25 | 8 s |
+| `rollout-completes` | `R7_Completes`; good releases, old replicas may go unready, no deadline | pass | 38,787 | 9,061 | 21 | 45 s |
 
 `Spend = "recheck"` in every passing config but the two `rollout-once-*`
 ones. The liveness configs are smaller than `rollout-base`, because TLC
@@ -511,11 +513,11 @@ the rule it does (`rollout-completes`).
 
 | Teeth config | What is taken away | TLC reports |
 |---|---|---|
-| `teeth-rollout-no-phase-check` | the replica controller spends budget only while the rollout runs | `R4_PauseHolds` violated (781 states) |
-| `teeth-rollout-no-cas` | the automatic rollback compares the service revision | `R8_UserWins` violated (904 states) |
-| `teeth-rollout-replace-ignores-stopping` | failure replacement counts a stopping replica as live | `R2_SurgeBound` violated (16,857 states) |
-| `teeth-rollout-no-unready-stalls` | the unready retirement rule, with no deadline | `R7_Completes` violated (1,216 states) |
-| `teeth-rollout-no-start` | the replica controller's budgeted starts (a mutant: `MayStart <- Off`), with no deadline | `R7_RolloutEnds` violated (497 states) |
+| `teeth-rollout-no-phase-check` | the replica controller spends budget only while the rollout runs | `R4_PauseHolds` violated (1,228 states) |
+| `teeth-rollout-no-cas` | the automatic rollback compares the service revision | `R8_UserWins` violated (785 states) |
+| `teeth-rollout-replace-ignores-stopping` | failure replacement counts a stopping replica as live | `R2_SurgeBound` violated (17,373 states) |
+| `teeth-rollout-no-unready-stalls` | the unready retirement rule, with no deadline | `R7_Completes` violated (969 states) |
+| `teeth-rollout-no-start` | the replica controller's budgeted starts (a mutant: `MayStart <- Off`), with no deadline | `R7_RolloutEnds` violated (480 states) |
 
 State counts in the teeth and finding tables are about: with several
 workers, where TLC stops on a violation varies from run to run.
